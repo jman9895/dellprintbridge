@@ -53,6 +53,13 @@ DEFAULT_CONFIG = {
     "display_name": "Dell Print Bridge",
 }
 
+IPP_OPERATION_NAMES = {
+    0x0002: "Print-Job",
+    0x0004: "Validate-Job",
+    0x000A: "Get-Jobs",
+    0x000B: "Get-Printer-Attributes",
+}
+
 
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
@@ -154,6 +161,11 @@ def ipp_int_attr(tag, name, value):
     return bytes([tag]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", 4) + struct.pack(">I", value)
 
 
+def ipp_bool_attr(name, value):
+    raw = b"\x01" if value else b"\x00"
+    return bytes([0x22]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", 1) + raw
+
+
 def parse_ipp_request(body):
     if len(body) < 8:
         raise ValueError("IPP request too short")
@@ -200,14 +212,14 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
 
     out = bytearray()
     out += version
-    out += struct.pack(">H", 0x0000)
+    out += struct.pack(">H", 0x0000)  # successful-ok
     out += request_id
-    out += b"\x01"
+    out += b"\x01"  # operation-attributes-tag
     out += ipp_attr(0x47, "attributes-charset", "utf-8")
     out += ipp_attr(0x48, "attributes-natural-language", "en-us")
 
     if include_printer_attrs:
-        out += b"\x04"
+        out += b"\x04"  # printer-attributes-tag
         out += ipp_attr(0x45, "printer-uri-supported", uri)
         out += ipp_attr(0x44, "uri-authentication-supported", "none")
         out += ipp_attr(0x44, "uri-security-supported", "none")
@@ -216,10 +228,17 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
         out += ipp_attr(0x41, "printer-make-and-model", "Windows Printer via DellPrintBridge")
         out += ipp_int_attr(0x23, "printer-state", 3)
         out += ipp_attr(0x44, "printer-state-reasons", "none")
+        out += ipp_bool_attr("printer-is-accepting-jobs", True)
+        out += ipp_int_attr(0x21, "queued-job-count", 0)
+        out += ipp_attr(0x47, "charset-configured", "utf-8")
+        out += ipp_attr(0x47, "charset-supported", "utf-8")
+        out += ipp_attr(0x48, "natural-language-configured", "en-us")
+        out += ipp_attr(0x48, "generated-natural-language-supported", "en-us")
         out += ipp_attr(0x44, "ipp-versions-supported", "1.1")
         out += ipp_attr(0x44, "", "2.0")
         out += ipp_int_attr(0x23, "operations-supported", 0x0002)
         out += ipp_int_attr(0x23, "", 0x0004)
+        out += ipp_int_attr(0x23, "", 0x000A)
         out += ipp_int_attr(0x23, "", 0x000B)
         out += ipp_attr(0x49, "document-format-default", "application/pdf")
         out += ipp_attr(0x49, "document-format-supported", "application/pdf")
@@ -228,9 +247,9 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
         out += ipp_attr(0x44, "", "iso_a4_210x297mm")
         out += ipp_attr(0x44, "sides-default", "one-sided")
         out += ipp_attr(0x44, "sides-supported", "one-sided")
-        out += bytes([0x22]) + struct.pack(">H", len("color-supported")) + b"color-supported" + struct.pack(">H", 1) + b"\x00"
+        out += ipp_bool_attr("color-supported", False)
 
-    out += b"\x03"
+    out += b"\x03"  # end-of-attributes-tag
     return bytes(out)
 
 
@@ -244,16 +263,23 @@ class IppHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             version, op_id, request_id, attrs, document = parse_ipp_request(body)
+            operation_name = IPP_OPERATION_NAMES.get(op_id, "Unknown")
             log.info(
-                "IPP request: client=%s operation=0x%04x content_length=%d document_bytes=%d",
+                "IPP request: client=%s operation=0x%04x (%s) content_length=%d document_bytes=%d",
                 client_ip,
                 op_id,
+                operation_name,
                 length,
                 len(document),
             )
 
             if op_id == 0x000B:  # Get-Printer-Attributes
                 response = build_ipp_response(version, request_id, include_printer_attrs=True)
+            elif op_id == 0x000A:  # Get-Jobs
+                # A successful response with no job-attributes groups means the queue is empty.
+                # Android's Default Print Service polls this operation while evaluating a printer.
+                log.info("Get-Jobs: reporting empty DellPrintBridge job list to %s", client_ip)
+                response = build_ipp_response(version, request_id)
             elif op_id == 0x0004:  # Validate-Job
                 response = build_ipp_response(version, request_id)
             elif op_id == 0x0002:  # Print-Job
@@ -273,7 +299,13 @@ class IppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
-            log.info("IPP response complete: client=%s operation=0x%04x elapsed=%.3fs", client_ip, op_id, time.monotonic() - started)
+            log.info(
+                "IPP response complete: client=%s operation=0x%04x (%s) elapsed=%.3fs",
+                client_ip,
+                op_id,
+                operation_name,
+                time.monotonic() - started,
+            )
         except Exception as exc:
             log.exception("IPP request failed: client=%s", client_ip)
             self.send_error(500, str(exc))
