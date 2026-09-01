@@ -168,7 +168,7 @@ def ipp_bool_attr(name, value):
 
 def parse_ipp_request(body):
     if len(body) < 8:
-        raise ValueError("IPP request too short")
+        raise ValueError(f"IPP request too short ({len(body)} bytes)")
     version = body[0:2]
     op_id = struct.unpack(">H", body[2:4])[0]
     request_id = body[4:8]
@@ -256,20 +256,131 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
 class IppHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle_expect_100(self):
+        client_ip = self.client_address[0]
+        log.info(
+            "IPP HTTP Expect: client=%s expect=%r content_length=%r transfer_encoding=%r",
+            client_ip,
+            self.headers.get("Expect"),
+            self.headers.get("Content-Length"),
+            self.headers.get("Transfer-Encoding"),
+        )
+        self.send_response_only(100)
+        self.end_headers()
+        return True
+
+    def read_chunked_body(self):
+        body = bytearray()
+        chunk_count = 0
+
+        while True:
+            size_line = self.rfile.readline(65537)
+            if not size_line:
+                raise ValueError("Unexpected EOF while reading chunk size")
+            if len(size_line) > 65536:
+                raise ValueError("HTTP chunk-size line too long")
+
+            size_text = size_line.strip().split(b";", 1)[0]
+            try:
+                chunk_size = int(size_text, 16)
+            except ValueError as exc:
+                raise ValueError(f"Invalid HTTP chunk size: {size_text!r}") from exc
+
+            if chunk_size == 0:
+                # Consume any trailer headers and the final blank line.
+                while True:
+                    trailer = self.rfile.readline(65537)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+
+            chunk = self.rfile.read(chunk_size)
+            if len(chunk) != chunk_size:
+                raise ValueError(
+                    f"Unexpected EOF while reading HTTP chunk: expected {chunk_size}, got {len(chunk)}"
+                )
+            body.extend(chunk)
+            chunk_count += 1
+
+            terminator = self.rfile.read(2)
+            if terminator != b"\r\n":
+                raise ValueError(f"Invalid HTTP chunk terminator: {terminator!r}")
+
+        log.info(
+            "IPP HTTP chunked body complete: client=%s chunks=%d bytes=%d",
+            self.client_address[0],
+            chunk_count,
+            len(body),
+        )
+        return bytes(body)
+
+    def read_request_body(self):
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        content_length = self.headers.get("Content-Length")
+
+        if "chunked" in transfer_encoding:
+            return self.read_chunked_body(), "chunked"
+
+        if content_length is not None:
+            try:
+                length = int(content_length)
+            except ValueError as exc:
+                raise ValueError(f"Invalid Content-Length: {content_length!r}") from exc
+            if length < 0:
+                raise ValueError(f"Invalid negative Content-Length: {length}")
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError(
+                    f"Unexpected EOF while reading request body: expected {length}, got {len(body)}"
+                )
+            return body, f"content-length:{length}"
+
+        return b"", "no-body-length"
+
+    def log_request_metadata(self):
+        log.info(
+            "IPP HTTP request: client=%s method=%s path=%s version=%s content_type=%r content_length=%r transfer_encoding=%r expect=%r connection=%r user_agent=%r",
+            self.client_address[0],
+            self.command,
+            self.path,
+            self.request_version,
+            self.headers.get("Content-Type"),
+            self.headers.get("Content-Length"),
+            self.headers.get("Transfer-Encoding"),
+            self.headers.get("Expect"),
+            self.headers.get("Connection"),
+            self.headers.get("User-Agent"),
+        )
+
     def do_POST(self):
         started = time.monotonic()
         client_ip = self.client_address[0]
+        operation_name = "Unknown"
+        op_id = 0
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
+            self.log_request_metadata()
+            body, body_mode = self.read_request_body()
+            log.info(
+                "IPP HTTP body received: client=%s mode=%s bytes=%d prefix=%s",
+                client_ip,
+                body_mode,
+                len(body),
+                body[:16].hex() if body else "<empty>",
+            )
+
+            if not body:
+                raise ValueError(
+                    "Empty IPP POST body; check Content-Length/Transfer-Encoding diagnostics above"
+                )
+
             version, op_id, request_id, attrs, document = parse_ipp_request(body)
             operation_name = IPP_OPERATION_NAMES.get(op_id, "Unknown")
             log.info(
-                "IPP request: client=%s operation=0x%04x (%s) content_length=%d document_bytes=%d",
+                "IPP request: client=%s operation=0x%04x (%s) received_bytes=%d document_bytes=%d",
                 client_ip,
                 op_id,
                 operation_name,
-                length,
+                len(body),
                 len(document),
             )
 
@@ -307,7 +418,15 @@ class IppHandler(BaseHTTPRequestHandler):
                 time.monotonic() - started,
             )
         except Exception as exc:
-            log.exception("IPP request failed: client=%s", client_ip)
+            log.exception(
+                "IPP request failed: client=%s operation=0x%04x (%s) content_length=%r transfer_encoding=%r expect=%r",
+                client_ip,
+                op_id,
+                operation_name,
+                self.headers.get("Content-Length"),
+                self.headers.get("Transfer-Encoding"),
+                self.headers.get("Expect"),
+            )
             self.send_error(500, str(exc))
 
     def log_message(self, fmt, *args):
