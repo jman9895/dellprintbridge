@@ -6,8 +6,10 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 
 import fitz
 import win32con
@@ -20,16 +22,31 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 APP_NAME = "DellPrintBridge"
 IPP_PORT = 631
 WEB_PORT = 8631
-CONFIG_PATH = os.path.join(os.environ.get("PROGRAMDATA", os.getcwd()), APP_NAME, "config.json")
-LOG_PATH = os.path.join(os.environ.get("PROGRAMDATA", os.getcwd()), APP_NAME, "dellprintbridge.log")
+APP_DIR = os.path.join(os.environ.get("PROGRAMDATA", os.getcwd()), APP_NAME)
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+LOG_PATH = os.path.join(APP_DIR, "dellprintbridge.log")
 
-os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-logging.basicConfig(
-    filename=LOG_PATH,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+os.makedirs(APP_DIR, exist_ok=True)
+
 log = logging.getLogger(APP_NAME)
+log.setLevel(logging.INFO)
+log.propagate = False
+
+if not log.handlers:
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
+
+    file_handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    log.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    log.addHandler(console_handler)
 
 DEFAULT_CONFIG = {
     "printer_name": "",
@@ -45,19 +62,26 @@ def load_config():
     except FileNotFoundError:
         pass
     except Exception:
-        log.exception("Failed to load config")
+        log.exception("Failed to load configuration from %s", CONFIG_PATH)
     return cfg
 
 
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    log.info(
+        "Configuration saved: printer=%r advertised_name=%r",
+        cfg.get("printer_name", ""),
+        cfg.get("display_name", ""),
+    )
 
 
 def get_printers():
     flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
     printers = win32print.EnumPrinters(flags, None, 2)
-    return sorted({p["pPrinterName"] for p in printers}, key=str.lower)
+    names = sorted({p["pPrinterName"] for p in printers}, key=str.lower)
+    log.debug("Enumerated %d Windows printer queues", len(names))
+    return names
 
 
 def get_local_ip():
@@ -73,32 +97,51 @@ def print_pdf(pdf_bytes, printer_name):
     if not printer_name:
         raise RuntimeError("No Windows printer queue is selected")
 
+    started = time.monotonic()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = len(doc)
+    log.info(
+        "Print job starting: printer=%r bytes=%d pages=%d",
+        printer_name,
+        len(pdf_bytes),
+        page_count,
+    )
+
     dc = win32ui.CreateDC()
-    dc.CreatePrinterDC(printer_name)
-
-    printable_w = dc.GetDeviceCaps(win32con.HORZRES)
-    printable_h = dc.GetDeviceCaps(win32con.VERTRES)
-
-    dc.StartDoc("DellPrintBridge job")
     try:
-        for page in doc:
-            dc.StartPage()
-            rect = page.rect
-            zoom = min(printable_w / rect.width, printable_h / rect.height)
-            matrix = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        dc.CreatePrinterDC(printer_name)
+        printable_w = dc.GetDeviceCaps(win32con.HORZRES)
+        printable_h = dc.GetDeviceCaps(win32con.VERTRES)
 
-            left = max(0, (printable_w - pix.width) // 2)
-            top = max(0, (printable_h - pix.height) // 2)
-            dib = ImageWin.Dib(image)
-            dib.draw(dc.GetHandleOutput(), (left, top, left + pix.width, top + pix.height))
-            dc.EndPage()
+        dc.StartDoc("DellPrintBridge job")
+        try:
+            for page_number, page in enumerate(doc, start=1):
+                dc.StartPage()
+                rect = page.rect
+                zoom = min(printable_w / rect.width, printable_h / rect.height)
+                matrix = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+                left = max(0, (printable_w - pix.width) // 2)
+                top = max(0, (printable_h - pix.height) // 2)
+                dib = ImageWin.Dib(image)
+                dib.draw(dc.GetHandleOutput(), (left, top, left + pix.width, top + pix.height))
+                dc.EndPage()
+                log.info("Rendered page %d/%d", page_number, page_count)
+        finally:
+            dc.EndDoc()
     finally:
-        dc.EndDoc()
         dc.DeleteDC()
         doc.close()
+
+    elapsed = time.monotonic() - started
+    log.info(
+        "Print job completed: printer=%r pages=%d elapsed=%.2fs",
+        printer_name,
+        page_count,
+        elapsed,
+    )
 
 
 def ipp_attr(tag, name, value):
@@ -195,11 +238,19 @@ class IppHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
+        started = time.monotonic()
+        client_ip = self.client_address[0]
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             version, op_id, request_id, attrs, document = parse_ipp_request(body)
-            log.info("IPP operation 0x%04x from %s", op_id, self.client_address[0])
+            log.info(
+                "IPP request: client=%s operation=0x%04x content_length=%d document_bytes=%d",
+                client_ip,
+                op_id,
+                length,
+                len(document),
+            )
 
             if op_id == 0x000B:  # Get-Printer-Attributes
                 response = build_ipp_response(version, request_id, include_printer_attrs=True)
@@ -208,11 +259,13 @@ class IppHandler(BaseHTTPRequestHandler):
             elif op_id == 0x0002:  # Print-Job
                 fmt_values = attrs.get("document-format", [b"application/pdf"])
                 fmt = fmt_values[-1].decode("utf-8", errors="replace")
+                log.info("Print-Job received: client=%s format=%s bytes=%d", client_ip, fmt, len(document))
                 if fmt != "application/pdf":
                     raise ValueError(f"Unsupported document format: {fmt}")
                 print_pdf(document, load_config().get("printer_name", ""))
                 response = build_ipp_response(version, request_id)
             else:
+                log.warning("Unsupported IPP operation from %s: 0x%04x", client_ip, op_id)
                 response = version + struct.pack(">H", 0x0501) + request_id + b"\x01" + ipp_attr(0x47, "attributes-charset", "utf-8") + ipp_attr(0x48, "attributes-natural-language", "en-us") + b"\x03"
 
             self.send_response(200)
@@ -220,8 +273,9 @@ class IppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
+            log.info("IPP response complete: client=%s operation=0x%04x elapsed=%.3fs", client_ip, op_id, time.monotonic() - started)
         except Exception as exc:
-            log.exception("IPP request failed")
+            log.exception("IPP request failed: client=%s", client_ip)
             self.send_error(500, str(exc))
 
     def log_message(self, fmt, *args):
@@ -253,6 +307,7 @@ small{color:#666}.ok{padding:10px;background:#e6f4ea;border-radius:8px}
 <button type="submit">Save configuration</button>
 </form>
 <p><small>IPP: TCP {{ipp_port}} &nbsp; • &nbsp; mDNS: UDP 5353 &nbsp; • &nbsp; Web UI: TCP {{web_port}}</small></p>
+<p><small>Log: {{log_path}}</small></p>
 </main></body></html>
 """
 
@@ -266,7 +321,15 @@ def index():
         cfg["display_name"] = request.form["display_name"].strip() or "Dell Print Bridge"
         save_config(cfg)
         saved = True
-    return render_template_string(PAGE, cfg=cfg, printers=get_printers(), saved=saved, ipp_port=IPP_PORT, web_port=WEB_PORT)
+    return render_template_string(
+        PAGE,
+        cfg=cfg,
+        printers=get_printers(),
+        saved=saved,
+        ipp_port=IPP_PORT,
+        web_port=WEB_PORT,
+        log_path=LOG_PATH,
+    )
 
 
 def advertise():
@@ -296,7 +359,13 @@ def advertise():
     )
     zc = Zeroconf(ip_version=IPVersion.V4Only)
     zc.register_service(info)
-    log.info("Advertising %s at %s:%d", display, ip, IPP_PORT)
+    log.info(
+        "mDNS advertisement registered: name=%r ip=%s port=%d service=%s",
+        display,
+        ip,
+        IPP_PORT,
+        service_name,
+    )
     return zc, info
 
 
@@ -305,15 +374,46 @@ def run():
     if not os.path.exists(CONFIG_PATH):
         save_config(cfg)
 
-    ipp_server = ThreadingHTTPServer(("0.0.0.0", IPP_PORT), IppHandler)
-    threading.Thread(target=ipp_server.serve_forever, daemon=True).start()
-    zc, info = advertise()
+    log.info("=" * 72)
+    log.info("DellPrintBridge starting")
+    log.info("Host: %s", socket.gethostname())
+    log.info("Python PID: %d", os.getpid())
+    log.info("Config path: %s", CONFIG_PATH)
+    log.info("Log path: %s", LOG_PATH)
+    log.info("Selected printer: %r", cfg.get("printer_name", ""))
+    log.info("Advertised name: %r", cfg.get("display_name", ""))
+
     try:
+        printers = get_printers()
+        log.info("Windows printer queues visible to process: %d", len(printers))
+        for printer in printers:
+            log.info("  Printer queue: %s", printer)
+    except Exception:
+        log.exception("Failed to enumerate Windows printer queues at startup")
+
+    ipp_server = ThreadingHTTPServer(("0.0.0.0", IPP_PORT), IppHandler)
+    threading.Thread(target=ipp_server.serve_forever, daemon=True, name="IPPServer").start()
+    log.info("IPP listener started on 0.0.0.0:%d", IPP_PORT)
+
+    zc = None
+    info = None
+    try:
+        zc, info = advertise()
+        log.info("Web UI starting on 0.0.0.0:%d", WEB_PORT)
         app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, use_reloader=False)
+    except Exception:
+        log.exception("DellPrintBridge terminated because of an unhandled error")
+        raise
     finally:
-        zc.unregister_service(info)
-        zc.close()
+        log.info("DellPrintBridge shutting down")
+        if zc and info:
+            try:
+                zc.unregister_service(info)
+            except Exception:
+                log.exception("Failed to unregister mDNS service")
+            zc.close()
         ipp_server.shutdown()
+        log.info("DellPrintBridge stopped")
 
 
 if __name__ == "__main__":
