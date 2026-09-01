@@ -2,7 +2,6 @@
 $ErrorActionPreference = 'Stop'
 
 function Find-PythonExecutable {
-    # First prefer commands already visible in this PowerShell session.
     foreach ($command in @('py', 'python')) {
         $resolved = Get-Command $command -ErrorAction SilentlyContinue
         if ($resolved) {
@@ -19,7 +18,6 @@ function Find-PythonExecutable {
         }
     }
 
-    # A fresh Python install may have updated the registry but not this process's PATH yet.
     $registryRoots = @(
         'HKCU:\Software\Python\PythonCore',
         'HKLM:\Software\Python\PythonCore',
@@ -42,7 +40,6 @@ function Find-PythonExecutable {
             if ($props.ExecutablePath) { $candidates += $props.ExecutablePath }
             if ($props.'(default)') { $candidates += (Join-Path $props.'(default)' 'python.exe') }
 
-            # The unnamed/default registry value is easier to read this way on some installs.
             try {
                 $defaultPath = (Get-Item $installPathKey).GetValue('')
                 if ($defaultPath) { $candidates += (Join-Path $defaultPath 'python.exe') }
@@ -54,7 +51,6 @@ function Find-PythonExecutable {
         }
     }
 
-    # Finally check common WinGet/python.org locations directly.
     $commonRoots = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Python'),
         (Join-Path $env:ProgramFiles 'Python*')
@@ -68,7 +64,6 @@ function Find-PythonExecutable {
         $dirs = Get-ChildItem $pattern -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending
 
-        # LOCALAPPDATA\Programs\Python is itself a container directory.
         if ((Test-Path $pattern -PathType Container)) {
             $dirs = Get-ChildItem $pattern -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name -Descending
@@ -110,7 +105,39 @@ foreach ($rule in $rules) {
     }
 }
 
+$taskName = 'DellPrintBridge'
+$venvPython = Join-Path $venv 'Scripts\python.exe'
+$appScript = Join-Path $PSScriptRoot 'dellprintbridge.py'
+$workingDirectory = $PSScriptRoot
+
+$action = New-ScheduledTaskAction `
+    -Execute $venvPython `
+    -Argument ('"{0}"' -f $appScript) `
+    -WorkingDirectory $workingDirectory
+
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+Register-ScheduledTask `
+    -TaskName $taskName `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal `
+    -Settings $settings `
+    -Description 'Starts DellPrintBridge at Windows startup.' `
+    -Force | Out-Null
+
 Write-Host ''
 Write-Host 'Development setup complete.' -ForegroundColor Green
-Write-Host "Run: $venv\Scripts\python.exe $PSScriptRoot\dellprintbridge.py"
-Write-Host 'Then open: http://localhost:8631'
+Write-Host "Startup task installed: $taskName" -ForegroundColor Green
+Write-Host "Log file: $env:ProgramData\DellPrintBridge\dellprintbridge.log"
+Write-Host "Manual run: $venvPython $appScript"
+Write-Host 'Web UI: http://localhost:8631'
+Write-Host ''
+Write-Host "To start it now in the background: Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Cyan
