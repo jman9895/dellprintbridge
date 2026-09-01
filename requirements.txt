@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+PyMuPDF>=1.24,<2
+pywin32>=306
+zeroconf>=0.132
