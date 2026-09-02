@@ -25,6 +25,7 @@ WEB_PORT = 8631
 APP_DIR = os.path.join(os.environ.get("PROGRAMDATA", os.getcwd()), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "dellprintbridge.log")
+APP_START_MONOTONIC = time.monotonic()
 
 os.makedirs(APP_DIR, exist_ok=True)
 
@@ -100,6 +101,10 @@ def get_local_ip():
         s.close()
 
 
+def get_instance_uuid(display_name):
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{socket.gethostname()}:{display_name}"))
+
+
 def print_pdf(pdf_bytes, printer_name):
     if not printer_name:
         raise RuntimeError("No Windows printer queue is selected")
@@ -166,6 +171,17 @@ def ipp_bool_attr(name, value):
     return bytes([0x22]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", 1) + raw
 
 
+def ipp_range_attr(name, lower, upper):
+    raw = struct.pack(">ii", lower, upper)
+    return bytes([0x33]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", len(raw)) + raw
+
+
+def ipp_resolution_attr(name, x_dpi, y_dpi, units=3):
+    # IPP resolution is x-res, y-res, then units. 3 means dots-per-inch.
+    raw = struct.pack(">iiB", x_dpi, y_dpi, units)
+    return bytes([0x32]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", len(raw)) + raw
+
+
 def parse_ipp_request(body):
     if len(body) < 8:
         raise ValueError(f"IPP request too short ({len(body)} bytes)")
@@ -203,12 +219,24 @@ def parse_ipp_request(body):
     raise ValueError("Missing IPP end-of-attributes tag")
 
 
+def decode_ipp_values(values):
+    decoded = []
+    for value in values:
+        try:
+            decoded.append(value.decode("utf-8"))
+        except UnicodeDecodeError:
+            decoded.append(f"0x{value.hex()}")
+    return decoded
+
+
 def build_ipp_response(version, request_id, include_printer_attrs=False):
     cfg = load_config()
     display = cfg.get("display_name") or "Dell Print Bridge"
     printer = cfg.get("printer_name") or "Unconfigured Windows Printer"
     host = socket.gethostname()
     uri = f"ipp://{host}.local:{IPP_PORT}/ipp/print"
+    printer_uuid = get_instance_uuid(display)
+    printer_up_time = max(1, int(time.monotonic() - APP_START_MONOTONIC))
 
     out = bytearray()
     out += version
@@ -220,16 +248,27 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
 
     if include_printer_attrs:
         out += b"\x04"  # printer-attributes-tag
+
+        # Identity and URI information.
         out += ipp_attr(0x45, "printer-uri-supported", uri)
         out += ipp_attr(0x44, "uri-authentication-supported", "none")
         out += ipp_attr(0x44, "uri-security-supported", "none")
         out += ipp_attr(0x42, "printer-name", display)
         out += ipp_attr(0x41, "printer-info", f"Windows queue: {printer}")
+        out += ipp_attr(0x41, "printer-location", f"Windows host: {host}")
         out += ipp_attr(0x41, "printer-make-and-model", "Windows Printer via DellPrintBridge")
-        out += ipp_int_attr(0x23, "printer-state", 3)
+        out += ipp_attr(0x45, "printer-uuid", f"urn:uuid:{printer_uuid}")
+        out += ipp_attr(0x45, "printer-more-info", f"http://{host}.local:{WEB_PORT}/")
+
+        # Basic printer state.
+        out += ipp_int_attr(0x23, "printer-state", 3)  # idle
         out += ipp_attr(0x44, "printer-state-reasons", "none")
         out += ipp_bool_attr("printer-is-accepting-jobs", True)
         out += ipp_int_attr(0x21, "queued-job-count", 0)
+        out += ipp_int_attr(0x21, "printer-up-time", printer_up_time)
+        out += ipp_int_attr(0x21, "printer-config-change-time", 0)
+
+        # Language / protocol support.
         out += ipp_attr(0x47, "charset-configured", "utf-8")
         out += ipp_attr(0x47, "charset-supported", "utf-8")
         out += ipp_attr(0x48, "natural-language-configured", "en-us")
@@ -240,14 +279,65 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
         out += ipp_int_attr(0x23, "", 0x0004)
         out += ipp_int_attr(0x23, "", 0x000A)
         out += ipp_int_attr(0x23, "", 0x000B)
+        out += ipp_bool_attr("multiple-document-jobs-supported", False)
+        out += ipp_int_attr(0x21, "multiple-operation-time-out", 60)
+
+        # Document handling. PDF is the only format the bridge currently accepts.
         out += ipp_attr(0x49, "document-format-default", "application/pdf")
+        out += ipp_attr(0x49, "document-format-preferred", "application/pdf")
         out += ipp_attr(0x49, "document-format-supported", "application/pdf")
+        out += ipp_attr(0x44, "compression-supported", "none")
+        out += ipp_attr(0x44, "pdl-override-supported", "attempted")
+
+        # Common job-template capabilities queried by Android/Mopria/CUPS clients.
+        out += ipp_int_attr(0x21, "copies-default", 1)
+        out += ipp_range_attr("copies-supported", 1, 99)
+        out += ipp_int_attr(0x23, "finishings-default", 3)  # none
+        out += ipp_int_attr(0x23, "finishings-supported", 3)
+
         out += ipp_attr(0x44, "media-default", "na_letter_8.5x11in")
         out += ipp_attr(0x44, "media-supported", "na_letter_8.5x11in")
         out += ipp_attr(0x44, "", "iso_a4_210x297mm")
+        out += ipp_attr(0x44, "media-ready", "na_letter_8.5x11in")
+
         out += ipp_attr(0x44, "sides-default", "one-sided")
         out += ipp_attr(0x44, "sides-supported", "one-sided")
-        out += ipp_bool_attr("color-supported", False)
+
+        out += ipp_int_attr(0x23, "orientation-requested-default", 3)  # portrait
+        out += ipp_int_attr(0x23, "orientation-requested-supported", 3)
+        out += ipp_int_attr(0x23, "", 4)  # landscape
+
+        out += ipp_resolution_attr("printer-resolution-default", 300, 300)
+        out += ipp_resolution_attr("printer-resolution-supported", 300, 300)
+
+        out += ipp_int_attr(0x23, "print-quality-default", 4)  # normal
+        out += ipp_int_attr(0x23, "print-quality-supported", 3)  # draft
+        out += ipp_int_attr(0x23, "", 4)  # normal
+        out += ipp_int_attr(0x23, "", 5)  # high
+
+        # The PDF -> RGB -> Windows GDI path preserves color and lets the Windows
+        # driver perform the final printer-specific rendering.
+        out += ipp_bool_attr("color-supported", True)
+        out += ipp_attr(0x44, "print-color-mode-default", "color")
+        out += ipp_attr(0x44, "print-color-mode-supported", "monochrome")
+        out += ipp_attr(0x44, "", "color")
+
+        out += ipp_attr(0x44, "print-scaling-default", "auto")
+        out += ipp_attr(0x44, "print-scaling-supported", "auto")
+        out += ipp_attr(0x44, "", "fit")
+        out += ipp_bool_attr("page-ranges-supported", False)
+        out += ipp_int_attr(0x21, "number-up-default", 1)
+        out += ipp_range_attr("number-up-supported", 1, 1)
+
+        out += ipp_attr(0x44, "job-creation-attributes-supported", "copies")
+        out += ipp_attr(0x44, "", "finishings")
+        out += ipp_attr(0x44, "", "media")
+        out += ipp_attr(0x44, "", "orientation-requested")
+        out += ipp_attr(0x44, "", "print-color-mode")
+        out += ipp_attr(0x44, "", "print-quality")
+        out += ipp_attr(0x44, "", "print-scaling")
+        out += ipp_attr(0x44, "", "printer-resolution")
+        out += ipp_attr(0x44, "", "sides")
 
     out += b"\x03"  # end-of-attributes-tag
     return bytes(out)
@@ -385,6 +475,13 @@ class IppHandler(BaseHTTPRequestHandler):
             )
 
             if op_id == 0x000B:  # Get-Printer-Attributes
+                requested = decode_ipp_values(attrs.get("requested-attributes", []))
+                log.info(
+                    "Get-Printer-Attributes requested-attributes: client=%s count=%d values=%s",
+                    client_ip,
+                    len(requested),
+                    requested if requested else "<not supplied>",
+                )
                 response = build_ipp_response(version, request_id, include_printer_attrs=True)
             elif op_id == 0x000A:  # Get-Jobs
                 # A successful response with no job-attributes groups means the queue is empty.
@@ -488,7 +585,7 @@ def advertise():
     ip = get_local_ip()
     display = cfg.get("display_name") or "Dell Print Bridge"
     service_name = f"{display}._ipp._tcp.local."
-    instance_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{socket.gethostname()}:{display}"))
+    instance_uuid = get_instance_uuid(display)
     props = {
         "txtvers": "1",
         "qtotal": "1",
@@ -496,7 +593,7 @@ def advertise():
         "ty": "Windows Printer via DellPrintBridge",
         "product": "(DellPrintBridge)",
         "pdl": "application/pdf",
-        "Color": "F",
+        "Color": "T",
         "Duplex": "F",
         "UUID": instance_uuid,
     }
