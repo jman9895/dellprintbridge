@@ -1,5 +1,6 @@
 Flask>=3.0,<4
 Pillow>=10.0,<12
 PyMuPDF>=1.24,<2
+pystray>=0.19,<1
 pywin32>=306
 zeroconf>=0.132
