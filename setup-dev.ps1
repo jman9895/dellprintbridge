@@ -105,6 +105,7 @@ foreach ($rule in $rules) {
     }
 }
 
+# Backend task: runs independently of an interactive login so IPP printing stays available.
 $taskName = 'DellPrintBridge'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
 $appScript = Join-Path $PSScriptRoot 'dellprintbridge.py'
@@ -130,14 +131,53 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings `
-    -Description 'Starts DellPrintBridge at Windows startup.' `
+    -Description 'Starts the DellPrintBridge backend at Windows startup.' `
+    -Force | Out-Null
+
+# Tray companion task: must run in the signed-in user's session. Windows isolates SYSTEM
+# services/tasks from the interactive desktop, so the tray UI is intentionally separate.
+$trayTaskName = 'DellPrintBridge Tray'
+$venvPythonw = Join-Path $venv 'Scripts\pythonw.exe'
+$trayScript = Join-Path $PSScriptRoot 'dellprintbridge_tray.py'
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+if (-not (Test-Path $venvPythonw)) {
+    throw "pythonw.exe was not found in the virtual environment: $venvPythonw"
+}
+
+$trayAction = New-ScheduledTaskAction `
+    -Execute $venvPythonw `
+    -Argument ('"{0}"' -f $trayScript) `
+    -WorkingDirectory $workingDirectory
+
+$trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+$trayPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $currentUser `
+    -LogonType Interactive `
+    -RunLevel Limited
+$traySettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable
+
+Stop-ScheduledTask -TaskName $trayTaskName -ErrorAction SilentlyContinue
+Register-ScheduledTask `
+    -TaskName $trayTaskName `
+    -Action $trayAction `
+    -Trigger $trayTrigger `
+    -Principal $trayPrincipal `
+    -Settings $traySettings `
+    -Description 'Shows DellPrintBridge status in the signed-in user system tray.' `
     -Force | Out-Null
 
 Write-Host ''
 Write-Host 'Development setup complete.' -ForegroundColor Green
 Write-Host "Startup task installed: $taskName" -ForegroundColor Green
+Write-Host "Tray task installed for: $currentUser" -ForegroundColor Green
+Write-Host "Tray task name: $trayTaskName" -ForegroundColor Green
 Write-Host "Log file: $env:ProgramData\DellPrintBridge\dellprintbridge.log"
 Write-Host "Manual run: $venvPython $appScript"
 Write-Host 'Web UI: http://localhost:8631'
 Write-Host ''
-Write-Host "To start it now in the background: Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Cyan
+Write-Host "To start the backend now: Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Cyan
+Write-Host "To start the tray icon now: Start-ScheduledTask -TaskName '$trayTaskName'" -ForegroundColor Cyan
