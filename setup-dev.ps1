@@ -79,6 +79,8 @@ function Find-PythonExecutable {
 }
 
 $venv = Join-Path $PSScriptRoot '.venv'
+$venvPython = Join-Path $venv 'Scripts\python.exe'
+$venvPythonw = Join-Path $venv 'Scripts\pythonw.exe'
 $python = Find-PythonExecutable
 
 if (-not $python) {
@@ -89,9 +91,19 @@ Write-Host "Using Python: $python" -ForegroundColor Cyan
 $versionText = & $python --version 2>&1
 Write-Host $versionText
 
-& $python -m venv $venv
-& "$venv\Scripts\python.exe" -m pip install --upgrade pip
-& "$venv\Scripts\python.exe" -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
+if (Test-Path $venvPython) {
+    Write-Host "Reusing existing virtual environment: $venv" -ForegroundColor Cyan
+} else {
+    Write-Host "Creating virtual environment: $venv" -ForegroundColor Cyan
+    & $python -m venv $venv
+}
+
+if (-not (Test-Path $venvPython)) {
+    throw "Virtual environment Python was not found after setup: $venvPython"
+}
+
+& $venvPython -m pip install --upgrade pip
+& $venvPython -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
 
 $rules = @(
     @{ Name='DellPrintBridge - IPP'; Protocol='TCP'; Port=631 },
@@ -107,7 +119,6 @@ foreach ($rule in $rules) {
 
 # Backend task: runs independently of an interactive login so IPP printing stays available.
 $taskName = 'DellPrintBridge'
-$venvPython = Join-Path $venv 'Scripts\python.exe'
 $appScript = Join-Path $PSScriptRoot 'dellprintbridge.py'
 $workingDirectory = $PSScriptRoot
 
@@ -137,7 +148,6 @@ Register-ScheduledTask `
 # Tray companion task: must run in the signed-in user's session. Windows isolates SYSTEM
 # services/tasks from the interactive desktop, so the tray UI is intentionally separate.
 $trayTaskName = 'DellPrintBridge Tray'
-$venvPythonw = Join-Path $venv 'Scripts\pythonw.exe'
 $trayScript = Join-Path $PSScriptRoot 'dellprintbridge_tray.py'
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
