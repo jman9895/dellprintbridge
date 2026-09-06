@@ -11,6 +11,22 @@ $backendExe = Join-Path $InstallRoot 'backend\DellPrintBridge.exe'
 $trayExe = Join-Path $InstallRoot 'tray\DellPrintBridgeTray.exe'
 $programDataDir = Join-Path $env:ProgramData 'DellPrintBridge'
 
+function Test-BridgeHealth {
+    param([int]$Attempts = 15)
+
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            $response = Invoke-WebRequest -Uri 'http://localhost:8631/' -UseBasicParsing -TimeoutSec 3
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                return $true
+            }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+
+    return $false
+}
+
 if (-not (Test-Path $backendExe)) {
     throw "Backend executable was not found: $backendExe"
 }
@@ -92,7 +108,14 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Start-ScheduledTask -TaskName $backendTask
-Start-Sleep -Seconds 2
+
+if (-not (Test-BridgeHealth)) {
+    throw 'DellPrintBridge backend did not respond on http://localhost:8631/ after installation.'
+}
+
 Start-ScheduledTask -TaskName $trayTask
 
 Write-Host 'DellPrintBridge runtime registration completed.' -ForegroundColor Green
+Write-Host "Backend task: $backendTask"
+Write-Host "Tray task:    $trayTask"
+Write-Host 'Web console:  http://localhost:8631/'
