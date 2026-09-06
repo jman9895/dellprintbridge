@@ -12,7 +12,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -53,3 +53,10 @@ jobs:
           name: DellPrintBridge-Setup-${{ steps.version.outputs.version }}
           path: build/installer/DellPrintBridge-Setup-*.exe
           if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/installer/DellPrintBridge-Setup-*.exe
+          generate_release_notes: true
