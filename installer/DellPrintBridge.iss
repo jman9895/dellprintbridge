@@ -18,6 +18,9 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\DellPrintBridge
 DefaultGroupName=DellPrintBridge
 DisableProgramGroupPage=yes
+DisableDirPage=yes
+DisableReadyPage=yes
+DisableWelcomePage=yes
 OutputBaseFilename=DellPrintBridge-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
@@ -29,19 +32,36 @@ UninstallDisplayName=DellPrintBridge
 SetupLogging=yes
 CloseApplications=yes
 RestartApplications=no
+ChangesAssociations=no
 
 [Files]
 Source: "..\build\dist\backend\DellPrintBridge\*"; DestDir: "{app}\backend"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\build\dist\tray\DellPrintBridgeTray\*"; DestDir: "{app}\tray"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\build\app-version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "uninstall-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "update-release.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DellPrintBridge Web Console"; Filename: "http://localhost:8631/"
+Name: "{group}\Uninstall DellPrintBridge"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\install-runtime.ps1"" -InstallRoot ""{app}"""; StatusMsg: "Configuring DellPrintBridge..."; Flags: runhidden waituntilterminated
-Filename: "http://localhost:8631/"; Description: "Open DellPrintBridge web console"; Flags: postinstall shellexec skipifsilent unchecked
+Filename: "http://localhost:8631/"; Description: "Open DellPrintBridge web console"; Flags: postinstall shellexec skipifsilent
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\installer\uninstall-runtime.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "DellPrintBridgeCleanup"
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  Cmd: String;
+begin
+  Result := '';
+  Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "Stop-ScheduledTask -TaskName ''DellPrintBridge'' -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName ''DellPrintBridge Tray'' -ErrorAction SilentlyContinue"';
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+end;
