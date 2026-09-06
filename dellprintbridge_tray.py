@@ -1,5 +1,6 @@
 import ctypes
 import os
+import sys
 import threading
 import time
 import urllib.request
@@ -29,12 +30,9 @@ def make_icon(running):
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
 
-    # Green means the DellPrintBridge web endpoint is responding. Gray means
-    # the tray companion is running but the bridge itself cannot be reached.
     fill = (22, 140, 62, 255) if running else (110, 110, 110, 255)
     draw.rounded_rectangle((5, 5, 59, 59), radius=12, fill=fill)
 
-    # Simple white printer glyph so no external icon asset is required.
     draw.rectangle((17, 12, 47, 28), fill=(255, 255, 255, 255))
     draw.rounded_rectangle((12, 24, 52, 45), radius=5, fill=(255, 255, 255, 255))
     draw.rectangle((18, 38, 46, 54), fill=fill)
@@ -48,36 +46,48 @@ def open_web_console(icon=None, item=None):
     webbrowser.open(WEB_URL)
 
 
-def run_elevated_powershell(arguments):
-    """Launch PowerShell elevated and return True if Windows accepted the launch."""
+def run_elevated_powershell(arguments, working_directory=None):
+    if working_directory is None:
+        working_directory = os.getcwd()
+
     result = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
         "powershell.exe",
         arguments,
-        os.path.dirname(os.path.abspath(__file__)),
+        working_directory,
         1,
     )
     return result > 32
 
 
+def get_runtime_root():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_update_script():
+    runtime_root = get_runtime_root()
+
+    if getattr(sys, "frozen", False):
+        packaged_updater = os.path.join(runtime_root, "installer", "update-release.ps1")
+        return packaged_updater if os.path.exists(packaged_updater) else None
+
+    dev_updater = os.path.join(runtime_root, "update.ps1")
+    return dev_updater if os.path.exists(dev_updater) else None
+
+
 def update_bridge(icon=None, item=None):
-    update_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.ps1")
-    if not os.path.exists(update_script):
+    update_script = get_update_script()
+    if not update_script:
         return
 
-    # update.ps1 already performs the controlled stop, update, setup, restart,
-    # rollback, and health-check workflow. Launch it elevated so it can manage
-    # the SYSTEM backend task. The tray process may disappear temporarily when
-    # the updater stops the tray scheduled task; update.ps1 starts it again.
     arguments = f'-NoProfile -ExecutionPolicy Bypass -File "{update_script}"'
-    run_elevated_powershell(arguments)
+    run_elevated_powershell(arguments, os.path.dirname(update_script))
 
 
 def exit_bridge(icon, item=None):
-    # The backend runs as SYSTEM, so stopping it requires elevation. This exits
-    # the current DellPrintBridge runtime completely, but leaves the scheduled
-    # tasks installed so normal startup/logon behavior still works later.
     command = (
         f"Stop-ScheduledTask -TaskName '{BACKEND_TASK_NAME}' "
         "-ErrorAction SilentlyContinue"
