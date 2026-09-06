@@ -1,3 +1,5 @@
+import ctypes
+import os
 import threading
 import time
 import urllib.request
@@ -8,6 +10,7 @@ from PIL import Image, ImageDraw
 
 WEB_URL = "http://localhost:8631/"
 CHECK_INTERVAL_SECONDS = 5
+BACKEND_TASK_NAME = "DellPrintBridge"
 
 _state_lock = threading.Lock()
 _bridge_running = False
@@ -45,8 +48,44 @@ def open_web_console(icon=None, item=None):
     webbrowser.open(WEB_URL)
 
 
-def stop_tray(icon, item=None):
-    icon.stop()
+def run_elevated_powershell(arguments):
+    """Launch PowerShell elevated and return True if Windows accepted the launch."""
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        "powershell.exe",
+        arguments,
+        os.path.dirname(os.path.abspath(__file__)),
+        1,
+    )
+    return result > 32
+
+
+def update_bridge(icon=None, item=None):
+    update_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.ps1")
+    if not os.path.exists(update_script):
+        return
+
+    # update.ps1 already performs the controlled stop, update, setup, restart,
+    # rollback, and health-check workflow. Launch it elevated so it can manage
+    # the SYSTEM backend task. The tray process may disappear temporarily when
+    # the updater stops the tray scheduled task; update.ps1 starts it again.
+    arguments = f'-NoProfile -ExecutionPolicy Bypass -File "{update_script}"'
+    run_elevated_powershell(arguments)
+
+
+def exit_bridge(icon, item=None):
+    # The backend runs as SYSTEM, so stopping it requires elevation. This exits
+    # the current DellPrintBridge runtime completely, but leaves the scheduled
+    # tasks installed so normal startup/logon behavior still works later.
+    command = (
+        f"Stop-ScheduledTask -TaskName '{BACKEND_TASK_NAME}' "
+        "-ErrorAction SilentlyContinue"
+    )
+    arguments = f'-NoProfile -ExecutionPolicy Bypass -Command "{command}"'
+
+    if run_elevated_powershell(arguments):
+        icon.stop()
 
 
 def update_status(icon):
@@ -101,7 +140,9 @@ def main():
             default=True,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit tray icon", stop_tray),
+        pystray.MenuItem("Update DellPrintBridge", update_bridge),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit DellPrintBridge", exit_bridge),
     )
 
     icon = pystray.Icon(
