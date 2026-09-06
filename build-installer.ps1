@@ -12,6 +12,7 @@ $python = Join-Path $venv 'Scripts\python.exe'
 $buildRoot = Join-Path $repoRoot 'build'
 $distRoot = Join-Path $buildRoot 'dist'
 $outputRoot = Join-Path $buildRoot 'installer'
+$versionFile = Join-Path $buildRoot 'app-version.txt'
 
 function Write-Step {
     param([string]$Message)
@@ -57,6 +58,13 @@ if (-not $systemPython) {
     throw 'Python 3 was not found. Install Python 3.10+ before building the installer.'
 }
 
+if (Test-Path $buildRoot) {
+    Remove-Item $buildRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+Set-Content -Path $versionFile -Value $Version -Encoding ASCII
+
 Write-Step "Preparing clean build environment for version $Version"
 if (Test-Path $venv) {
     Remove-Item $venv -Recurse -Force
@@ -73,12 +81,6 @@ if (-not $SkipPythonInstall) {
     & $python -m pip install -r (Join-Path $repoRoot 'requirements.txt')
     & $python -m pip install -r (Join-Path $repoRoot 'requirements-build.txt')
 }
-
-if (Test-Path $buildRoot) {
-    Remove-Item $buildRoot -Recurse -Force
-}
-New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
-New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
 Write-Step 'Building backend executable'
 & $python -m PyInstaller `
@@ -115,6 +117,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Tray PyInstaller build failed with exit code $LASTEXITCODE"
 }
 
+$backendExe = Join-Path $distRoot 'backend\DellPrintBridge\DellPrintBridge.exe'
+$trayExe = Join-Path $distRoot 'tray\DellPrintBridgeTray\DellPrintBridgeTray.exe'
+if (-not (Test-Path $backendExe)) { throw "Backend executable not found after build: $backendExe" }
+if (-not (Test-Path $trayExe)) { throw "Tray executable not found after build: $trayExe" }
+
 $inno = Find-InnoSetupCompiler
 if (-not $inno) {
     throw 'Inno Setup 6 was not found. Install it with: winget install --id JRSoftware.InnoSetup -e'
@@ -138,3 +145,4 @@ if (-not $installer) {
 Write-Host ''
 Write-Host 'DellPrintBridge installer build completed successfully.' -ForegroundColor Green
 Write-Host "Installer: $($installer.FullName)"
+Write-Host "Version:   $Version"
