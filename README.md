@@ -44,6 +44,8 @@ DellPrintBridge runs on a Windows machine that already has the printer installed
 - Renders PDF pages with PyMuPDF/Pillow.
 - Sends rendered pages through the selected Windows queue using `pywin32` and the normal Windows GDI/spooler path.
 - Leaves the final printer-specific communication to the existing Windows vendor driver.
+- Includes a Windows system-tray companion for status and control.
+- Includes an in-place updater for development/Git installations.
 
 There is **no DellPrintBridge Android app**. That is intentional. The goal is for the printer to appear in Android's normal system print dialog.
 
@@ -68,7 +70,7 @@ There is **no DellPrintBridge Android app**. That is intentional. The goal is fo
 +-------------+-------------+
 | Windows PC / Server       |
 |                           |
-| DellPrintBridge           |
+| DellPrintBridge backend   |
 |  - mDNS advertisement     |
 |  - IPP server             |
 |  - PDF renderer           |
@@ -91,6 +93,14 @@ There is **no DellPrintBridge Android app**. That is intentional. The goal is fo
 | Dell C1765nfw in the      |
 | original test environment |
 +---------------------------+
+
+Interactive Windows session
+        |
+        +--> DellPrintBridge tray companion
+             - running/unavailable status
+             - open web console
+             - update
+             - exit backend + tray
 ```
 
 The important distinction is that the Android device does **not** need to understand the physical printer.
@@ -122,6 +132,23 @@ Advertised name: Dell Print Bridge
 
 The web UI is deliberately simple right now. It is a configuration surface, not a replacement for the printer's own management interface.
 
+## System tray companion
+
+DellPrintBridge includes a lightweight tray process that runs in the signed-in user's Windows session while the backend continues to run independently as SYSTEM.
+
+The icon provides a quick visual status indication:
+
+- **Green:** the DellPrintBridge web endpoint is responding.
+- **Gray:** the tray companion is running, but the backend cannot currently be reached.
+
+Tray actions:
+
+- **Double-click / Open DellPrintBridge** opens the local web console.
+- **Update DellPrintBridge** launches the updater elevated.
+- **Exit DellPrintBridge** stops the backend and closes the tray companion.
+
+The tray process is intentionally separate from the backend because Windows isolates SYSTEM tasks/services from the interactive user desktop.
+
 ## Current status
 
 ### Working today
@@ -147,6 +174,7 @@ Current functionality includes:
 - mDNS/DNS-SD discovery.
 - IPP over TCP 631.
 - IPP 1.1/2.0 responses for the operations currently required by the tested Android client.
+- Expanded Android-compatible printer capability advertisement.
 - `Get-Printer-Attributes`.
 - `Get-Jobs`.
 - `Validate-Job`.
@@ -158,21 +186,25 @@ Current functionality includes:
 - PDF rendering through the Windows graphics/printing stack.
 - Rotating diagnostic logs.
 - Windows Firewall rule creation from the development setup script.
-- Startup scheduled-task installation from the development setup script.
+- Startup scheduled-task installation for the backend.
+- Interactive logon scheduled task for the tray companion.
+- System-tray status and control.
+- In-place Git updater with restart, health check, and rollback handling.
 
 ### Prototype limitations
 
 This is still early software. It does **not** yet provide:
 
-- A packaged self-contained EXE/installer.
 - A native Windows Service.
 - Automatic mDNS refresh after changing configuration; restart the bridge after changing the published queue/name.
 - Automatic discovery of every Windows driver capability.
-- Full color/duplex/tray/media capability translation.
+- Full dynamic color/duplex/tray/media capability translation.
 - PWG Raster input.
 - Apple URF/AirPrint support as a tested feature.
 - Multiple simultaneously published Windows queues.
 - Authentication or Internet-facing security.
+
+A packaged Windows installer build pipeline is now included in the repository, but it is still being validated before being treated as the primary installation method.
 
 The current project should be considered a **trusted-LAN prototype**.
 
@@ -188,7 +220,9 @@ Android's Default Print Service can then query the bridge using IPP.
 
 During development, the Android client identified itself as a CUPS-based IPP/2.0 client. A key compatibility issue turned out to be HTTP `Expect: 100-continue`: Android sends this before a number of IPP POST bodies. Correctly acknowledging that HTTP exchange was necessary for the client to proceed reliably to the actual print job.
 
-This is also why DellPrintBridge contains HTTP handling in addition to IPP parsing: **IPP is carried over HTTP**, so both layers have to behave in a way the client accepts.
+Android also proved sensitive to the advertised IPP capability set. DellPrintBridge now returns a broader set of printer identity, document-format, media, resolution, color, quality, and job-creation attributes so the Android client can accept and present the printer consistently.
+
+This is why DellPrintBridge contains HTTP handling in addition to IPP parsing: **IPP is carried over HTTP**, so both layers have to behave in a way the client accepts.
 
 ## Print-job flow
 
@@ -239,10 +273,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 The development setup script:
 
 1. Finds an installed Python 3 runtime.
-2. Creates a local `.venv` virtual environment.
-3. Installs the Python requirements.
-4. Creates private-profile Windows Firewall rules for DellPrintBridge.
-5. Registers a startup scheduled task named `DellPrintBridge` running as SYSTEM.
+2. Creates a local `.venv` virtual environment when one does not already exist.
+3. Reuses the existing `.venv` on later runs.
+4. Installs/updates the Python requirements.
+5. Creates private-profile Windows Firewall rules for DellPrintBridge.
+6. Registers a startup scheduled task named `DellPrintBridge` running as SYSTEM.
+7. Registers a `DellPrintBridge Tray` task for the signed-in user.
 
 Firewall ports:
 
@@ -260,17 +296,110 @@ Manual foreground operation is useful during development because log output rema
 .\.venv\Scripts\python.exe .\dellprintbridge.py
 ```
 
-### Start the scheduled task
+### Start the scheduled tasks
 
 ```powershell
 Start-ScheduledTask -TaskName "DellPrintBridge"
+Start-ScheduledTask -TaskName "DellPrintBridge Tray"
 ```
 
-Check it with:
+Check the backend with:
 
 ```powershell
 Get-ScheduledTask -TaskName "DellPrintBridge" | Get-ScheduledTaskInfo
 ```
+
+## In-place updater
+
+Git/development installations can update in place with:
+
+```powershell
+.\update.ps1
+```
+
+The updater:
+
+1. Verifies the Git working tree is safe to update.
+2. Fetches the latest code from the configured upstream branch.
+3. Stops the backend and tray tasks.
+4. Performs a fast-forward-only Git update when a newer commit exists.
+5. Reuses the existing Python virtual environment.
+6. Updates dependencies and scheduled-task registration.
+7. Restarts the backend and tray.
+8. Performs a health check against `http://localhost:8631/`.
+9. Attempts to roll back to the previous commit if an update fails after pulling new code.
+
+Updater diagnostics are written to:
+
+```text
+%ProgramData%\DellPrintBridge\update.log
+```
+
+The updater is safe to run when the code is already current; it will still verify dependencies, tasks, restart behavior, and the health check.
+
+## One-click Windows installer
+
+The repository now contains the first installer build workflow. The target experience is a normal Windows setup executable that requires **no Python installation, no Git installation, and no command-line setup** on the destination machine.
+
+The installer build uses:
+
+- **PyInstaller** to create self-contained Windows application folders for the backend and tray companion.
+- **Inno Setup 6** to package those files into a standard Windows installer.
+- Installer helper scripts to register the scheduled tasks and Windows Firewall rules.
+- A GitHub Actions workflow for reproducible Windows builds.
+
+The planned installed layout is:
+
+```text
+C:\Program Files\DellPrintBridge\
+    backend\
+        DellPrintBridge.exe
+        ...runtime files...
+    tray\
+        DellPrintBridgeTray.exe
+        ...runtime files...
+    installer\
+        install-runtime.ps1
+        uninstall-runtime.ps1
+```
+
+Runtime configuration and logs remain under:
+
+```text
+%ProgramData%\DellPrintBridge\
+```
+
+### Build the installer locally
+
+On a Windows development machine with Python 3 and Inno Setup 6 installed:
+
+```powershell
+.\build-installer.ps1 -Version 0.1.0
+```
+
+If Inno Setup is not installed:
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
+```
+
+A successful build produces:
+
+```text
+build\installer\DellPrintBridge-Setup-0.1.0.exe
+```
+
+### GitHub Actions build
+
+The workflow at:
+
+```text
+.github/workflows/build-installer.yml
+```
+
+can be run manually with a version number or triggered by a `v*` tag. It builds on a Windows runner and uploads the resulting setup executable as a workflow artifact.
+
+The installer path is currently under active validation. Until that validation is complete, the development setup remains the known-good installation method.
 
 ## Configuration
 
@@ -377,9 +506,14 @@ Currently:
 ```text
 config.json
 dellprintbridge.log
+update.log
 ```
 
 The log uses rotation so normal diagnostics do not grow indefinitely.
+
+## Uninstall behavior
+
+The installer cleanup path removes the DellPrintBridge scheduled tasks and Windows Firewall rules. Runtime configuration and logs under `%ProgramData%\DellPrintBridge` are intentionally preserved so a reinstall does not automatically discard the selected printer or diagnostic history.
 
 ## Security
 
@@ -387,7 +521,7 @@ DellPrintBridge currently has **no authentication**.
 
 It is designed for use on a trusted private network while the project is under development. Do not expose TCP 631 or TCP 8631 directly to the public Internet.
 
-The setup script creates inbound firewall rules only for the Windows **Private** network profile.
+The setup scripts create inbound firewall rules only for the Windows **Private** network profile.
 
 ## Project philosophy
 
@@ -405,18 +539,19 @@ The Dell C1765nfw was simply the reason to build it. The architecture is intenti
 
 Potential next steps include:
 
-- Package the application as a self-contained executable.
-- Install/run it as a proper Windows Service.
+- Validate the one-click installer on a clean Windows machine/VM.
+- Publish signed/release installer builds.
+- Add release-aware self-update support for packaged installations.
+- Install/run the backend as a proper Windows Service.
 - Improve the web management console.
 - Dynamically refresh mDNS advertisements after configuration changes.
 - Read capabilities from the selected Windows printer/driver.
-- Advertise accurate color, duplex, media, tray, resolution, and copy capabilities.
+- Advertise accurate color, duplex, media, tray, resolution, and copy capabilities dynamically.
 - Improve IPP job state/status reporting.
 - Add additional document formats where useful.
 - Explore PWG Raster support.
 - Explore/test AirPrint compatibility.
 - Support multiple published Windows queues.
-- Build an installer/uninstaller suitable for non-development systems.
 
 ## About
 
