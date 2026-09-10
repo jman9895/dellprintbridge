@@ -78,6 +78,24 @@ def get_update_script():
     return dev_updater if os.path.exists(dev_updater) else None
 
 
+def start_bridge(icon=None, item=None):
+    # The backend task runs as SYSTEM, so starting it from an interactive tray
+    # session requires elevation. Starting an already-running task is harmless,
+    # but the menu item is disabled while the web health check says the bridge
+    # is available.
+    command = (
+        f"Start-ScheduledTask -TaskName '{BACKEND_TASK_NAME}' "
+        "-ErrorAction Stop"
+    )
+    arguments = f'-NoProfile -ExecutionPolicy Bypass -Command "{command}"'
+    run_elevated_powershell(arguments)
+
+
+def start_bridge_enabled(item=None):
+    with _state_lock:
+        return not _bridge_running
+
+
 def update_bridge(icon=None, item=None):
     update_script = get_update_script()
     if not update_script:
@@ -109,6 +127,7 @@ def update_status(icon):
 
         if changed:
             icon.icon = make_icon(running)
+            icon.update_menu()
 
         icon.title = (
             "DellPrintBridge - Running"
@@ -150,6 +169,11 @@ def main():
             default=True,
         ),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "Start DellPrintBridge",
+            start_bridge,
+            enabled=start_bridge_enabled,
+        ),
         pystray.MenuItem("Update DellPrintBridge", update_bridge),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit DellPrintBridge", exit_bridge),
