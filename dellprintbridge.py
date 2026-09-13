@@ -1,10 +1,9 @@
-import io
 import json
 import logging
 import os
+import re
 import socket
 import struct
-import tempfile
 import threading
 import time
 import uuid
@@ -35,7 +34,6 @@ log.propagate = False
 
 if not log.handlers:
     formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s")
-
     file_handler = RotatingFileHandler(
         LOG_PATH,
         maxBytes=5 * 1024 * 1024,
@@ -49,9 +47,25 @@ if not log.handlers:
     console_handler.setFormatter(formatter)
     log.addHandler(console_handler)
 
-DEFAULT_CONFIG = {
-    "printer_name": "",
-    "display_name": "Dell Print Bridge",
+DEFAULT_CONFIG = {"printers": []}
+
+PRINTER_PROFILES = {
+    "standard": {
+        "label": "Letter / A4 color printer",
+        "media_default": "na_letter_8.5x11in",
+        "media_supported": ["na_letter_8.5x11in", "iso_a4_210x297mm"],
+        "dpi": 300,
+        "color": True,
+        "mdns_ty": "Windows Printer via DellPrintBridge",
+    },
+    "thermal_4x6": {
+        "label": "4 x 6 thermal label printer",
+        "media_default": "na_index-4x6_4x6in",
+        "media_supported": ["na_index-4x6_4x6in"],
+        "dpi": 203,
+        "color": False,
+        "mdns_ty": "4x6 Thermal Printer via DellPrintBridge",
+    },
 }
 
 IPP_OPERATION_NAMES = {
@@ -61,26 +75,91 @@ IPP_OPERATION_NAMES = {
     0x000B: "Get-Printer-Attributes",
 }
 
+_mdns_lock = threading.Lock()
+_mdns_zc = None
+_mdns_infos = []
+
+
+def slugify(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "printer"
+
+
+def unique_printer_id(cfg, base):
+    existing = {p.get("id") for p in cfg.get("printers", [])}
+    candidate = slugify(base)
+    if candidate not in existing:
+        return candidate
+    i = 2
+    while f"{candidate}-{i}" in existing:
+        i += 1
+    return f"{candidate}-{i}"
+
+
+def normalize_config(raw):
+    if isinstance(raw.get("printers"), list):
+        cfg = {"printers": []}
+        for index, item in enumerate(raw["printers"]):
+            if not isinstance(item, dict):
+                continue
+            printer_id = item.get("id") or f"printer-{index + 1}"
+            profile = item.get("profile", "standard")
+            if profile not in PRINTER_PROFILES:
+                profile = "standard"
+            cfg["printers"].append(
+                {
+                    "id": printer_id,
+                    "queue_name": item.get("queue_name", ""),
+                    "display_name": item.get("display_name") or "Windows Printer",
+                    "profile": profile,
+                    "enabled": bool(item.get("enabled", True)),
+                    "resource": item.get("resource") or f"ipp/printers/{printer_id}",
+                }
+            )
+        return cfg, False
+
+    legacy_queue = raw.get("printer_name", "")
+    legacy_display = raw.get("display_name") or "Dell Print Bridge"
+    cfg = {"printers": []}
+    if legacy_queue or "printer_name" in raw or "display_name" in raw:
+        cfg["printers"].append(
+            {
+                "id": "default",
+                "queue_name": legacy_queue,
+                "display_name": legacy_display,
+                "profile": "standard",
+                "enabled": True,
+                "resource": "ipp/print",
+            }
+        )
+        return cfg, True
+    return cfg, False
+
 
 def load_config():
-    cfg = DEFAULT_CONFIG.copy()
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            raw = json.load(f)
     except FileNotFoundError:
-        pass
+        raw = DEFAULT_CONFIG.copy()
     except Exception:
         log.exception("Failed to load configuration from %s", CONFIG_PATH)
+        raw = DEFAULT_CONFIG.copy()
+
+    cfg, migrated = normalize_config(raw)
+    if migrated:
+        log.info("Migrated legacy single-printer configuration to multi-printer format")
     return cfg
 
 
 def save_config(cfg):
+    clean_cfg, _ = normalize_config(cfg)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(clean_cfg, f, indent=2)
     log.info(
-        "Configuration saved: printer=%r advertised_name=%r",
-        cfg.get("printer_name", ""),
-        cfg.get("display_name", ""),
+        "Configuration saved: published_printers=%d enabled=%d",
+        len(clean_cfg["printers"]),
+        sum(1 for p in clean_cfg["printers"] if p.get("enabled")),
     )
 
 
@@ -101,8 +180,22 @@ def get_local_ip():
         s.close()
 
 
-def get_instance_uuid(display_name):
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{socket.gethostname()}:{display_name}"))
+def get_instance_uuid(printer_cfg):
+    stable_key = printer_cfg.get("id") or printer_cfg.get("display_name") or "printer"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{socket.gethostname()}:{stable_key}"))
+
+
+def get_profile(printer_cfg):
+    return PRINTER_PROFILES.get(printer_cfg.get("profile"), PRINTER_PROFILES["standard"])
+
+
+def find_printer_for_path(path):
+    request_path = path.split("?", 1)[0].strip("/")
+    cfg = load_config()
+    for printer in cfg.get("printers", []):
+        if printer.get("enabled") and printer.get("resource", "").strip("/") == request_path:
+            return printer
+    return None
 
 
 def print_pdf(pdf_bytes, printer_name):
@@ -159,27 +252,56 @@ def print_pdf(pdf_bytes, printer_name):
 def ipp_attr(tag, name, value):
     if isinstance(value, str):
         value = value.encode("utf-8")
-    return bytes([tag]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", len(value)) + value
+    return (
+        bytes([tag])
+        + struct.pack(">H", len(name))
+        + name.encode("utf-8")
+        + struct.pack(">H", len(value))
+        + value
+    )
 
 
 def ipp_int_attr(tag, name, value):
-    return bytes([tag]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", 4) + struct.pack(">I", value)
+    return (
+        bytes([tag])
+        + struct.pack(">H", len(name))
+        + name.encode("utf-8")
+        + struct.pack(">H", 4)
+        + struct.pack(">I", value)
+    )
 
 
 def ipp_bool_attr(name, value):
     raw = b"\x01" if value else b"\x00"
-    return bytes([0x22]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", 1) + raw
+    return (
+        bytes([0x22])
+        + struct.pack(">H", len(name))
+        + name.encode("utf-8")
+        + struct.pack(">H", 1)
+        + raw
+    )
 
 
 def ipp_range_attr(name, lower, upper):
     raw = struct.pack(">ii", lower, upper)
-    return bytes([0x33]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", len(raw)) + raw
+    return (
+        bytes([0x33])
+        + struct.pack(">H", len(name))
+        + name.encode("utf-8")
+        + struct.pack(">H", len(raw))
+        + raw
+    )
 
 
 def ipp_resolution_attr(name, x_dpi, y_dpi, units=3):
-    # IPP resolution is x-res, y-res, then units. 3 means dots-per-inch.
     raw = struct.pack(">iiB", x_dpi, y_dpi, units)
-    return bytes([0x32]) + struct.pack(">H", len(name)) + name.encode("utf-8") + struct.pack(">H", len(raw)) + raw
+    return (
+        bytes([0x32])
+        + struct.pack(">H", len(name))
+        + name.encode("utf-8")
+        + struct.pack(">H", len(raw))
+        + raw
+    )
 
 
 def parse_ipp_request(body):
@@ -201,17 +323,17 @@ def parse_ipp_request(body):
             continue
         if i + 4 > len(body):
             raise ValueError("Malformed IPP attributes")
-        name_len = struct.unpack(">H", body[i:i+2])[0]
+        name_len = struct.unpack(">H", body[i:i + 2])[0]
         i += 2
         if name_len:
-            name = body[i:i+name_len].decode("utf-8", errors="replace")
+            name = body[i:i + name_len].decode("utf-8", errors="replace")
             i += name_len
             last_name = name
         else:
             name = last_name
-        value_len = struct.unpack(">H", body[i:i+2])[0]
+        value_len = struct.unpack(">H", body[i:i + 2])[0]
         i += 2
-        value = body[i:i+value_len]
+        value = body[i:i + value_len]
         i += value_len
         if name:
             attrs.setdefault(name, []).append(value)
@@ -229,46 +351,43 @@ def decode_ipp_values(values):
     return decoded
 
 
-def build_ipp_response(version, request_id, include_printer_attrs=False):
-    cfg = load_config()
-    display = cfg.get("display_name") or "Dell Print Bridge"
-    printer = cfg.get("printer_name") or "Unconfigured Windows Printer"
+def build_ipp_response(version, request_id, printer_cfg, include_printer_attrs=False):
+    display = printer_cfg.get("display_name") or "Windows Printer"
+    queue_name = printer_cfg.get("queue_name") or "Unconfigured Windows Printer"
+    profile = get_profile(printer_cfg)
     host = socket.gethostname()
-    uri = f"ipp://{host}.local:{IPP_PORT}/ipp/print"
-    printer_uuid = get_instance_uuid(display)
+    resource = printer_cfg.get("resource", "ipp/print").strip("/")
+    uri = f"ipp://{host}.local:{IPP_PORT}/{resource}"
+    printer_uuid = get_instance_uuid(printer_cfg)
     printer_up_time = max(1, int(time.monotonic() - APP_START_MONOTONIC))
 
     out = bytearray()
     out += version
-    out += struct.pack(">H", 0x0000)  # successful-ok
+    out += struct.pack(">H", 0x0000)
     out += request_id
-    out += b"\x01"  # operation-attributes-tag
+    out += b"\x01"
     out += ipp_attr(0x47, "attributes-charset", "utf-8")
     out += ipp_attr(0x48, "attributes-natural-language", "en-us")
 
     if include_printer_attrs:
-        out += b"\x04"  # printer-attributes-tag
-
-        # Identity and URI information.
+        out += b"\x04"
         out += ipp_attr(0x45, "printer-uri-supported", uri)
         out += ipp_attr(0x44, "uri-authentication-supported", "none")
         out += ipp_attr(0x44, "uri-security-supported", "none")
         out += ipp_attr(0x42, "printer-name", display)
-        out += ipp_attr(0x41, "printer-info", f"Windows queue: {printer}")
+        out += ipp_attr(0x41, "printer-info", f"Windows queue: {queue_name}")
         out += ipp_attr(0x41, "printer-location", f"Windows host: {host}")
-        out += ipp_attr(0x41, "printer-make-and-model", "Windows Printer via DellPrintBridge")
+        out += ipp_attr(0x41, "printer-make-and-model", profile["mdns_ty"])
         out += ipp_attr(0x45, "printer-uuid", f"urn:uuid:{printer_uuid}")
         out += ipp_attr(0x45, "printer-more-info", f"http://{host}.local:{WEB_PORT}/")
 
-        # Basic printer state.
-        out += ipp_int_attr(0x23, "printer-state", 3)  # idle
+        out += ipp_int_attr(0x23, "printer-state", 3)
         out += ipp_attr(0x44, "printer-state-reasons", "none")
         out += ipp_bool_attr("printer-is-accepting-jobs", True)
         out += ipp_int_attr(0x21, "queued-job-count", 0)
         out += ipp_int_attr(0x21, "printer-up-time", printer_up_time)
         out += ipp_int_attr(0x21, "printer-config-change-time", 0)
 
-        # Language / protocol support.
         out += ipp_attr(0x47, "charset-configured", "utf-8")
         out += ipp_attr(0x47, "charset-supported", "utf-8")
         out += ipp_attr(0x48, "natural-language-configured", "en-us")
@@ -282,45 +401,46 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
         out += ipp_bool_attr("multiple-document-jobs-supported", False)
         out += ipp_int_attr(0x21, "multiple-operation-time-out", 60)
 
-        # Document handling. PDF is the only format the bridge currently accepts.
         out += ipp_attr(0x49, "document-format-default", "application/pdf")
         out += ipp_attr(0x49, "document-format-preferred", "application/pdf")
         out += ipp_attr(0x49, "document-format-supported", "application/pdf")
         out += ipp_attr(0x44, "compression-supported", "none")
         out += ipp_attr(0x44, "pdl-override-supported", "attempted")
 
-        # Common job-template capabilities queried by Android/Mopria/CUPS clients.
         out += ipp_int_attr(0x21, "copies-default", 1)
         out += ipp_range_attr("copies-supported", 1, 99)
-        out += ipp_int_attr(0x23, "finishings-default", 3)  # none
+        out += ipp_int_attr(0x23, "finishings-default", 3)
         out += ipp_int_attr(0x23, "finishings-supported", 3)
 
-        out += ipp_attr(0x44, "media-default", "na_letter_8.5x11in")
-        out += ipp_attr(0x44, "media-supported", "na_letter_8.5x11in")
-        out += ipp_attr(0x44, "", "iso_a4_210x297mm")
-        out += ipp_attr(0x44, "media-ready", "na_letter_8.5x11in")
+        out += ipp_attr(0x44, "media-default", profile["media_default"])
+        for index, media in enumerate(profile["media_supported"]):
+            out += ipp_attr(0x44, "media-supported" if index == 0 else "", media)
+        out += ipp_attr(0x44, "media-ready", profile["media_default"])
 
         out += ipp_attr(0x44, "sides-default", "one-sided")
         out += ipp_attr(0x44, "sides-supported", "one-sided")
 
-        out += ipp_int_attr(0x23, "orientation-requested-default", 3)  # portrait
+        out += ipp_int_attr(0x23, "orientation-requested-default", 3)
         out += ipp_int_attr(0x23, "orientation-requested-supported", 3)
-        out += ipp_int_attr(0x23, "", 4)  # landscape
+        out += ipp_int_attr(0x23, "", 4)
 
-        out += ipp_resolution_attr("printer-resolution-default", 300, 300)
-        out += ipp_resolution_attr("printer-resolution-supported", 300, 300)
+        dpi = int(profile["dpi"])
+        out += ipp_resolution_attr("printer-resolution-default", dpi, dpi)
+        out += ipp_resolution_attr("printer-resolution-supported", dpi, dpi)
 
-        out += ipp_int_attr(0x23, "print-quality-default", 4)  # normal
-        out += ipp_int_attr(0x23, "print-quality-supported", 3)  # draft
-        out += ipp_int_attr(0x23, "", 4)  # normal
-        out += ipp_int_attr(0x23, "", 5)  # high
+        out += ipp_int_attr(0x23, "print-quality-default", 4)
+        out += ipp_int_attr(0x23, "print-quality-supported", 3)
+        out += ipp_int_attr(0x23, "", 4)
+        out += ipp_int_attr(0x23, "", 5)
 
-        # The PDF -> RGB -> Windows GDI path preserves color and lets the Windows
-        # driver perform the final printer-specific rendering.
-        out += ipp_bool_attr("color-supported", True)
-        out += ipp_attr(0x44, "print-color-mode-default", "color")
-        out += ipp_attr(0x44, "print-color-mode-supported", "monochrome")
-        out += ipp_attr(0x44, "", "color")
+        out += ipp_bool_attr("color-supported", profile["color"])
+        if profile["color"]:
+            out += ipp_attr(0x44, "print-color-mode-default", "color")
+            out += ipp_attr(0x44, "print-color-mode-supported", "monochrome")
+            out += ipp_attr(0x44, "", "color")
+        else:
+            out += ipp_attr(0x44, "print-color-mode-default", "monochrome")
+            out += ipp_attr(0x44, "print-color-mode-supported", "monochrome")
 
         out += ipp_attr(0x44, "print-scaling-default", "auto")
         out += ipp_attr(0x44, "print-scaling-supported", "auto")
@@ -339,7 +459,7 @@ def build_ipp_response(version, request_id, include_printer_attrs=False):
         out += ipp_attr(0x44, "", "printer-resolution")
         out += ipp_attr(0x44, "", "sides")
 
-    out += b"\x03"  # end-of-attributes-tag
+    out += b"\x03"
     return bytes(out)
 
 
@@ -362,28 +482,23 @@ class IppHandler(BaseHTTPRequestHandler):
     def read_chunked_body(self):
         body = bytearray()
         chunk_count = 0
-
         while True:
             size_line = self.rfile.readline(65537)
             if not size_line:
                 raise ValueError("Unexpected EOF while reading chunk size")
             if len(size_line) > 65536:
                 raise ValueError("HTTP chunk-size line too long")
-
             size_text = size_line.strip().split(b";", 1)[0]
             try:
                 chunk_size = int(size_text, 16)
             except ValueError as exc:
                 raise ValueError(f"Invalid HTTP chunk size: {size_text!r}") from exc
-
             if chunk_size == 0:
-                # Consume any trailer headers and the final blank line.
                 while True:
                     trailer = self.rfile.readline(65537)
                     if trailer in (b"\r\n", b"\n", b""):
                         break
                 break
-
             chunk = self.rfile.read(chunk_size)
             if len(chunk) != chunk_size:
                 raise ValueError(
@@ -391,11 +506,9 @@ class IppHandler(BaseHTTPRequestHandler):
                 )
             body.extend(chunk)
             chunk_count += 1
-
             terminator = self.rfile.read(2)
             if terminator != b"\r\n":
                 raise ValueError(f"Invalid HTTP chunk terminator: {terminator!r}")
-
         log.info(
             "IPP HTTP chunked body complete: client=%s chunks=%d bytes=%d",
             self.client_address[0],
@@ -407,10 +520,8 @@ class IppHandler(BaseHTTPRequestHandler):
     def read_request_body(self):
         transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
         content_length = self.headers.get("Content-Length")
-
         if "chunked" in transfer_encoding:
             return self.read_chunked_body(), "chunked"
-
         if content_length is not None:
             try:
                 length = int(content_length)
@@ -424,7 +535,6 @@ class IppHandler(BaseHTTPRequestHandler):
                     f"Unexpected EOF while reading request body: expected {length}, got {len(body)}"
                 )
             return body, f"content-length:{length}"
-
         return b"", "no-body-length"
 
     def log_request_metadata(self):
@@ -449,15 +559,20 @@ class IppHandler(BaseHTTPRequestHandler):
         op_id = 0
         try:
             self.log_request_metadata()
+            printer_cfg = find_printer_for_path(self.path)
+            if not printer_cfg:
+                self.send_error(404, "Unknown or disabled DellPrintBridge printer")
+                return
+
             body, body_mode = self.read_request_body()
             log.info(
-                "IPP HTTP body received: client=%s mode=%s bytes=%d prefix=%s",
+                "IPP HTTP body received: client=%s printer=%r mode=%s bytes=%d prefix=%s",
                 client_ip,
+                printer_cfg.get("display_name"),
                 body_mode,
                 len(body),
                 body[:16].hex() if body else "<empty>",
             )
-
             if not body:
                 raise ValueError(
                     "Empty IPP POST body; check Content-Length/Transfer-Encoding diagnostics above"
@@ -466,41 +581,61 @@ class IppHandler(BaseHTTPRequestHandler):
             version, op_id, request_id, attrs, document = parse_ipp_request(body)
             operation_name = IPP_OPERATION_NAMES.get(op_id, "Unknown")
             log.info(
-                "IPP request: client=%s operation=0x%04x (%s) received_bytes=%d document_bytes=%d",
+                "IPP request: client=%s printer=%r operation=0x%04x (%s) received_bytes=%d document_bytes=%d",
                 client_ip,
+                printer_cfg.get("display_name"),
                 op_id,
                 operation_name,
                 len(body),
                 len(document),
             )
 
-            if op_id == 0x000B:  # Get-Printer-Attributes
+            if op_id == 0x000B:
                 requested = decode_ipp_values(attrs.get("requested-attributes", []))
                 log.info(
-                    "Get-Printer-Attributes requested-attributes: client=%s count=%d values=%s",
+                    "Get-Printer-Attributes requested-attributes: client=%s printer=%r count=%d values=%s",
                     client_ip,
+                    printer_cfg.get("display_name"),
                     len(requested),
                     requested if requested else "<not supplied>",
                 )
-                response = build_ipp_response(version, request_id, include_printer_attrs=True)
-            elif op_id == 0x000A:  # Get-Jobs
-                # A successful response with no job-attributes groups means the queue is empty.
-                # Android's Default Print Service polls this operation while evaluating a printer.
-                log.info("Get-Jobs: reporting empty DellPrintBridge job list to %s", client_ip)
-                response = build_ipp_response(version, request_id)
-            elif op_id == 0x0004:  # Validate-Job
-                response = build_ipp_response(version, request_id)
-            elif op_id == 0x0002:  # Print-Job
+                response = build_ipp_response(
+                    version, request_id, printer_cfg, include_printer_attrs=True
+                )
+            elif op_id == 0x000A:
+                log.info(
+                    "Get-Jobs: reporting empty job list to %s for %r",
+                    client_ip,
+                    printer_cfg.get("display_name"),
+                )
+                response = build_ipp_response(version, request_id, printer_cfg)
+            elif op_id == 0x0004:
+                response = build_ipp_response(version, request_id, printer_cfg)
+            elif op_id == 0x0002:
                 fmt_values = attrs.get("document-format", [b"application/pdf"])
                 fmt = fmt_values[-1].decode("utf-8", errors="replace")
-                log.info("Print-Job received: client=%s format=%s bytes=%d", client_ip, fmt, len(document))
+                log.info(
+                    "Print-Job received: client=%s printer=%r format=%s bytes=%d",
+                    client_ip,
+                    printer_cfg.get("display_name"),
+                    fmt,
+                    len(document),
+                )
                 if fmt != "application/pdf":
                     raise ValueError(f"Unsupported document format: {fmt}")
-                print_pdf(document, load_config().get("printer_name", ""))
-                response = build_ipp_response(version, request_id)
+                print_pdf(document, printer_cfg.get("queue_name", ""))
+                response = build_ipp_response(version, request_id, printer_cfg)
             else:
                 log.warning("Unsupported IPP operation from %s: 0x%04x", client_ip, op_id)
-                response = version + struct.pack(">H", 0x0501) + request_id + b"\x01" + ipp_attr(0x47, "attributes-charset", "utf-8") + ipp_attr(0x48, "attributes-natural-language", "en-us") + b"\x03"
+                response = (
+                    version
+                    + struct.pack(">H", 0x0501)
+                    + request_id
+                    + b"\x01"
+                    + ipp_attr(0x47, "attributes-charset", "utf-8")
+                    + ipp_attr(0x48, "attributes-natural-language", "en-us")
+                    + b"\x03"
+                )
 
             self.send_response(200)
             self.send_header("Content-Type", "application/ipp")
@@ -508,21 +643,20 @@ class IppHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response)
             log.info(
-                "IPP response complete: client=%s operation=0x%04x (%s) elapsed=%.3fs",
+                "IPP response complete: client=%s printer=%r operation=0x%04x (%s) elapsed=%.3fs",
                 client_ip,
+                printer_cfg.get("display_name"),
                 op_id,
                 operation_name,
                 time.monotonic() - started,
             )
         except Exception as exc:
             log.exception(
-                "IPP request failed: client=%s operation=0x%04x (%s) content_length=%r transfer_encoding=%r expect=%r",
+                "IPP request failed: client=%s operation=0x%04x (%s) path=%s",
                 client_ip,
                 op_id,
                 operation_name,
-                self.headers.get("Content-Length"),
-                self.headers.get("Transfer-Encoding"),
-                self.headers.get("Expect"),
+                self.path,
             )
             self.send_error(500, str(exc))
 
@@ -531,73 +665,232 @@ class IppHandler(BaseHTTPRequestHandler):
 
 
 app = Flask(__name__)
+
 PAGE = """
 <!doctype html>
-<html><head><meta charset="utf-8"><title>DellPrintBridge</title>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DellPrintBridge</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;background:#f5f6f7;color:#202124;margin:0}
-main{max-width:760px;margin:48px auto;background:#fff;padding:32px;border-radius:14px;box-shadow:0 4px 18px #0001}
-h1{margin-top:0} label{display:block;font-weight:600;margin:18px 0 6px} select,input{width:100%;padding:10px;box-sizing:border-box}
-button{margin-top:20px;padding:10px 18px;border:0;border-radius:8px;background:#137333;color:#fff;font-weight:600;cursor:pointer}
-small{color:#666}.ok{padding:10px;background:#e6f4ea;border-radius:8px}
-</style></head>
-<body><main><h1>DellPrintBridge</h1>
-<p>Expose a Windows printer queue to native IPP clients such as Android Default Print Service.</p>
-{% if saved %}<p class="ok">Configuration saved.</p>{% endif %}
-<form method="post">
+main{max-width:900px;margin:48px auto;background:#fff;padding:32px;border-radius:14px;box-shadow:0 4px 18px #0001}
+h1{margin-top:0}.subtle{color:#666}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{border:1px solid #dadce0;border-radius:12px;padding:18px;margin:16px 0;background:#fff}
+label{display:block;font-weight:600;margin:12px 0 6px}
+select,input{width:100%;padding:10px;box-sizing:border-box;border:1px solid #bbb;border-radius:6px}
+button{margin-top:14px;padding:10px 18px;border:0;border-radius:8px;background:#137333;color:#fff;font-weight:600;cursor:pointer}
+button.secondary{background:#5f6368}.danger{background:#b3261e}.inline{display:inline}
+.ok{padding:10px;background:#e6f4ea;border-radius:8px}.warn{padding:10px;background:#fef7e0;border-radius:8px}
+.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;background:#e6f4ea;color:#137333}
+.badge.off{background:#eee;color:#666}
+.checkbox{display:flex;align-items:center;gap:8px;margin-top:12px}.checkbox input{width:auto}
+code{background:#f1f3f4;padding:2px 5px;border-radius:4px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}main{margin:0;border-radius:0}}
+</style>
+</head>
+<body><main>
+<h1>DellPrintBridge</h1>
+<p>Publish one or more Windows printer queues to native IPP clients such as Android Default Print Service.</p>
+{% if saved %}<p class="ok">{{ saved }}</p>{% endif %}
+{% if error %}<p class="warn">{{ error }}</p>{% endif %}
+
+<h2>Published printers</h2>
+{% if not cfg.printers %}
+<p class="subtle">No printers are published yet. Add one below.</p>
+{% endif %}
+
+{% for p in cfg.printers %}
+<div class="card">
+<form method="post" action="{{ url_for('save_printer', printer_id=p.id) }}">
+<div style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+<strong>{{ p.display_name }}</strong>
+<span class="badge {% if not p.enabled %}off{% endif %}">{{ "Enabled" if p.enabled else "Disabled" }}</span>
+</div>
+<div class="grid">
+<div>
 <label>Windows printer queue</label>
-<select name="printer_name" required>
-<option value="">Select a printer...</option>
-{% for p in printers %}<option value="{{p}}" {% if p==cfg.printer_name %}selected{% endif %}>{{p}}</option>{% endfor %}
+<select name="queue_name" required>
+{% for q in printers %}<option value="{{q}}" {% if q==p.queue_name %}selected{% endif %}>{{q}}</option>{% endfor %}
 </select>
+</div>
+<div>
 <label>Advertised printer name</label>
-<input name="display_name" value="{{cfg.display_name}}" required>
-<button type="submit">Save configuration</button>
+<input name="display_name" value="{{p.display_name}}" required>
+</div>
+<div>
+<label>Capability profile</label>
+<select name="profile">
+{% for key, profile in profiles.items() %}
+<option value="{{key}}" {% if key==p.profile %}selected{% endif %}>{{profile.label}}</option>
+{% endfor %}
+</select>
+</div>
+<div>
+<label>IPP resource</label>
+<input value="/{{p.resource}}" disabled>
+</div>
+</div>
+<label class="checkbox"><input type="checkbox" name="enabled" value="1" {% if p.enabled %}checked{% endif %}> Advertise this printer</label>
+<button type="submit">Save printer</button>
 </form>
+<form method="post" action="{{ url_for('delete_printer', printer_id=p.id) }}" class="inline" onsubmit="return confirm('Remove this published printer?');">
+<button type="submit" class="danger">Remove</button>
+</form>
+</div>
+{% endfor %}
+
+<h2>Add printer</h2>
+<div class="card">
+<form method="post" action="{{ url_for('add_printer') }}">
+<div class="grid">
+<div>
+<label>Windows printer queue</label>
+<select name="queue_name" required>
+<option value="">Select a printer...</option>
+{% for q in printers %}<option value="{{q}}">{{q}}</option>{% endfor %}
+</select>
+</div>
+<div>
+<label>Advertised printer name</label>
+<input name="display_name" placeholder="e.g. Nelko Thermal" required>
+</div>
+<div>
+<label>Capability profile</label>
+<select name="profile">
+{% for key, profile in profiles.items() %}<option value="{{key}}">{{profile.label}}</option>{% endfor %}
+</select>
+</div>
+</div>
+<button type="submit">+ Add printer</button>
+</form>
+</div>
+
 <p><small>IPP: TCP {{ipp_port}} &nbsp; • &nbsp; mDNS: UDP 5353 &nbsp; • &nbsp; Web UI: TCP {{web_port}}</small></p>
-<p><small>Log: {{log_path}}</small></p>
+<p><small>Changes to published printers refresh mDNS automatically. Log: {{log_path}}</small></p>
 </main></body></html>
 """
 
 
-@app.route("/", methods=["GET", "POST"])
+def duplicate_display_name(cfg, display_name, exclude_id=None):
+    wanted = display_name.casefold()
+    return any(
+        p.get("id") != exclude_id and p.get("display_name", "").casefold() == wanted
+        for p in cfg.get("printers", [])
+    )
+
+
+@app.route("/")
 def index():
-    cfg = load_config()
-    saved = False
-    if request.method == "POST":
-        cfg["printer_name"] = request.form["printer_name"]
-        cfg["display_name"] = request.form["display_name"].strip() or "Dell Print Bridge"
-        save_config(cfg)
-        saved = True
     return render_template_string(
         PAGE,
-        cfg=cfg,
+        cfg=load_config(),
         printers=get_printers(),
-        saved=saved,
+        profiles=PRINTER_PROFILES,
+        saved=request.args.get("saved"),
+        error=request.args.get("error"),
         ipp_port=IPP_PORT,
         web_port=WEB_PORT,
         log_path=LOG_PATH,
     )
 
 
-def advertise():
+@app.post("/printer/add")
+def add_printer():
     cfg = load_config()
-    ip = get_local_ip()
-    display = cfg.get("display_name") or "Dell Print Bridge"
+    queue_name = request.form.get("queue_name", "").strip()
+    display_name = request.form.get("display_name", "").strip()
+    profile = request.form.get("profile", "standard")
+
+    if not queue_name or not display_name:
+        return redirect(url_for("index", error="Queue and advertised name are required."))
+    if queue_name not in get_printers():
+        return redirect(url_for("index", error="Selected Windows printer queue was not found."))
+    if profile not in PRINTER_PROFILES:
+        profile = "standard"
+    if duplicate_display_name(cfg, display_name):
+        return redirect(url_for("index", error="Each advertised printer name must be unique."))
+
+    printer_id = unique_printer_id(cfg, display_name)
+    cfg["printers"].append(
+        {
+            "id": printer_id,
+            "queue_name": queue_name,
+            "display_name": display_name,
+            "profile": profile,
+            "enabled": True,
+            "resource": f"ipp/printers/{printer_id}",
+        }
+    )
+    save_config(cfg)
+    refresh_mdns()
+    return redirect(url_for("index", saved=f"Added {display_name}."))
+
+
+@app.post("/printer/<printer_id>/save")
+def save_printer(printer_id):
+    cfg = load_config()
+    printer = next((p for p in cfg["printers"] if p.get("id") == printer_id), None)
+    if not printer:
+        return redirect(url_for("index", error="Published printer was not found."))
+
+    queue_name = request.form.get("queue_name", "").strip()
+    display_name = request.form.get("display_name", "").strip()
+    profile = request.form.get("profile", "standard")
+    enabled = request.form.get("enabled") == "1"
+
+    if not queue_name or not display_name:
+        return redirect(url_for("index", error="Queue and advertised name are required."))
+    if queue_name not in get_printers():
+        return redirect(url_for("index", error="Selected Windows printer queue was not found."))
+    if duplicate_display_name(cfg, display_name, exclude_id=printer_id):
+        return redirect(url_for("index", error="Each advertised printer name must be unique."))
+    if profile not in PRINTER_PROFILES:
+        profile = "standard"
+
+    printer.update(
+        {
+            "queue_name": queue_name,
+            "display_name": display_name,
+            "profile": profile,
+            "enabled": enabled,
+        }
+    )
+    save_config(cfg)
+    refresh_mdns()
+    return redirect(url_for("index", saved=f"Saved {display_name}."))
+
+
+@app.post("/printer/<printer_id>/delete")
+def delete_printer(printer_id):
+    cfg = load_config()
+    target = next((p for p in cfg["printers"] if p.get("id") == printer_id), None)
+    if not target:
+        return redirect(url_for("index", error="Published printer was not found."))
+    cfg["printers"] = [p for p in cfg["printers"] if p.get("id") != printer_id]
+    save_config(cfg)
+    refresh_mdns()
+    return redirect(url_for("index", saved=f"Removed {target.get('display_name', 'printer')}."))
+
+
+def build_mdns_info(printer_cfg, ip):
+    display = printer_cfg.get("display_name") or "Windows Printer"
+    resource = printer_cfg.get("resource", "ipp/print").strip("/")
+    profile = get_profile(printer_cfg)
+    instance_uuid = get_instance_uuid(printer_cfg)
     service_name = f"{display}._ipp._tcp.local."
-    instance_uuid = get_instance_uuid(display)
     props = {
         "txtvers": "1",
         "qtotal": "1",
-        "rp": "ipp/print",
-        "ty": "Windows Printer via DellPrintBridge",
+        "rp": resource,
+        "ty": profile["mdns_ty"],
         "product": "(DellPrintBridge)",
         "pdl": "application/pdf",
-        "Color": "T",
+        "Color": "T" if profile["color"] else "F",
         "Duplex": "F",
         "UUID": instance_uuid,
     }
-    info = ServiceInfo(
+    return ServiceInfo(
         "_ipp._tcp.local.",
         service_name,
         addresses=[socket.inet_aton(ip)],
@@ -605,21 +898,51 @@ def advertise():
         properties=props,
         server=f"{socket.gethostname()}.local.",
     )
-    zc = Zeroconf(ip_version=IPVersion.V4Only)
-    zc.register_service(info)
-    log.info(
-        "mDNS advertisement registered: name=%r ip=%s port=%d service=%s",
-        display,
-        ip,
-        IPP_PORT,
-        service_name,
-    )
-    return zc, info
+
+
+def refresh_mdns():
+    global _mdns_zc, _mdns_infos
+    with _mdns_lock:
+        if _mdns_zc is None:
+            return
+
+        for info in _mdns_infos:
+            try:
+                _mdns_zc.unregister_service(info)
+            except Exception:
+                log.exception("Failed to unregister mDNS service %s", info.name)
+        _mdns_infos = []
+
+        ip = get_local_ip()
+        cfg = load_config()
+        for printer in cfg.get("printers", []):
+            if not printer.get("enabled") or not printer.get("queue_name"):
+                continue
+            info = build_mdns_info(printer, ip)
+            _mdns_zc.register_service(info)
+            _mdns_infos.append(info)
+            log.info(
+                "mDNS advertisement registered: name=%r queue=%r resource=/%s ip=%s port=%d profile=%s",
+                printer.get("display_name"),
+                printer.get("queue_name"),
+                printer.get("resource"),
+                ip,
+                IPP_PORT,
+                printer.get("profile"),
+            )
 
 
 def run():
+    global _mdns_zc
     cfg = load_config()
-    if not os.path.exists(CONFIG_PATH):
+    raw_needs_save = not os.path.exists(CONFIG_PATH)
+    if not raw_needs_save:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw_needs_save = "printers" not in json.load(f)
+        except Exception:
+            raw_needs_save = False
+    if raw_needs_save:
         save_config(cfg)
 
     log.info("=" * 72)
@@ -628,8 +951,16 @@ def run():
     log.info("Python PID: %d", os.getpid())
     log.info("Config path: %s", CONFIG_PATH)
     log.info("Log path: %s", LOG_PATH)
-    log.info("Selected printer: %r", cfg.get("printer_name", ""))
-    log.info("Advertised name: %r", cfg.get("display_name", ""))
+    log.info("Configured published printers: %d", len(cfg.get("printers", [])))
+    for printer in cfg.get("printers", []):
+        log.info(
+            "  Published printer: name=%r queue=%r enabled=%s profile=%s resource=/%s",
+            printer.get("display_name"),
+            printer.get("queue_name"),
+            printer.get("enabled"),
+            printer.get("profile"),
+            printer.get("resource"),
+        )
 
     try:
         printers = get_printers()
@@ -643,10 +974,9 @@ def run():
     threading.Thread(target=ipp_server.serve_forever, daemon=True, name="IPPServer").start()
     log.info("IPP listener started on 0.0.0.0:%d", IPP_PORT)
 
-    zc = None
-    info = None
+    _mdns_zc = Zeroconf(ip_version=IPVersion.V4Only)
     try:
-        zc, info = advertise()
+        refresh_mdns()
         log.info("Web UI starting on 0.0.0.0:%d", WEB_PORT)
         app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, use_reloader=False)
     except Exception:
@@ -654,12 +984,14 @@ def run():
         raise
     finally:
         log.info("DellPrintBridge shutting down")
-        if zc and info:
-            try:
-                zc.unregister_service(info)
-            except Exception:
-                log.exception("Failed to unregister mDNS service")
-            zc.close()
+        with _mdns_lock:
+            for info in _mdns_infos:
+                try:
+                    _mdns_zc.unregister_service(info)
+                except Exception:
+                    log.exception("Failed to unregister mDNS service %s", info.name)
+            _mdns_zc.close()
+            _mdns_zc = None
         ipp_server.shutdown()
         log.info("DellPrintBridge stopped")
 
