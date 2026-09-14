@@ -14,6 +14,7 @@ import fitz
 import win32con
 import win32print
 import win32ui
+import sitecustomize  # Ensure active-user printer preference hook is loaded under SYSTEM.
 from flask import Flask, redirect, render_template_string, request, url_for
 from PIL import Image, ImageWin
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
