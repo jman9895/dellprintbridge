@@ -671,21 +671,41 @@ PAGE = """
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
 <title>DellPrintBridge</title>
 <style>
+:root{color-scheme:light dark}
 body{font-family:Segoe UI,Arial,sans-serif;background:#f5f6f7;color:#202124;margin:0}
 main{max-width:900px;margin:48px auto;background:#fff;padding:32px;border-radius:14px;box-shadow:0 4px 18px #0001}
 h1{margin-top:0}.subtle{color:#666}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .card{border:1px solid #dadce0;border-radius:12px;padding:18px;margin:16px 0;background:#fff}
 label{display:block;font-weight:600;margin:12px 0 6px}
-select,input{width:100%;padding:10px;box-sizing:border-box;border:1px solid #bbb;border-radius:6px}
+select,input{width:100%;padding:10px;box-sizing:border-box;border:1px solid #bbb;border-radius:6px;background:#fff;color:#202124}
+input:disabled{background:#f1f3f4;color:#5f6368}
 button{margin-top:14px;padding:10px 18px;border:0;border-radius:8px;background:#137333;color:#fff;font-weight:600;cursor:pointer}
 button.secondary{background:#5f6368}.danger{background:#b3261e}.inline{display:inline}
-.ok{padding:10px;background:#e6f4ea;border-radius:8px}.warn{padding:10px;background:#fef7e0;border-radius:8px}
+.ok{padding:10px;background:#e6f4ea;color:#137333;border-radius:8px}.warn{padding:10px;background:#fef7e0;color:#5f4200;border-radius:8px}
 .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;background:#e6f4ea;color:#137333}
 .badge.off{background:#eee;color:#666}
 .checkbox{display:flex;align-items:center;gap:8px;margin-top:12px}.checkbox input{width:auto}
 code{background:#f1f3f4;padding:2px 5px;border-radius:4px}
+@media (prefers-color-scheme: dark){
+  body{background:#111315;color:#e8eaed}
+  main{background:#1c1f22;box-shadow:0 4px 18px #0008}
+  .subtle{color:#aeb4ba}
+  .card{background:#24282c;border-color:#3b4147}
+  select,input{background:#171a1d;color:#e8eaed;border-color:#555d65}
+  select:focus,input:focus{outline:2px solid #34a853;outline-offset:1px}
+  input:disabled{background:#2c3136;color:#aeb4ba}
+  button{background:#188038}
+  button.secondary{background:#5f6368}
+  .danger{background:#c5221f}
+  .ok{background:#173b25;color:#81c995}
+  .warn{background:#493b16;color:#fdd663}
+  .badge{background:#173b25;color:#81c995}
+  .badge.off{background:#34383d;color:#b7bdc3}
+  code{background:#2c3136;color:#e8eaed}
+}
 @media(max-width:700px){.grid{grid-template-columns:1fr}main{margin:0;border-radius:0}}
 </style>
 </head>
