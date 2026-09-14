@@ -13,8 +13,9 @@ from logging.handlers import RotatingFileHandler
 import fitz
 import win32con
 import win32print
+import win32security
+import win32ts
 import win32ui
-import sitecustomize  # Ensure active-user printer preference hook is loaded under SYSTEM.
 from flask import Flask, redirect, render_template_string, request, url_for
 from PIL import Image, ImageWin
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
@@ -163,6 +164,83 @@ def find_printer_for_path(path):
     return None
 
 
+def create_printer_dc(printer_name):
+    """Create a printer DC using the active user's printer preferences when possible.
+
+    DellPrintBridge normally runs as SYSTEM. Some Windows printer drivers store
+    driver-private settings, including thermal dithering modes, in the interactive
+    user's printer DEVMODE. Creating the DC while briefly impersonating that user
+    preserves those settings while allowing the bridge itself to remain a SYSTEM task.
+    """
+    dc = win32ui.CreateDC()
+    token = None
+
+    try:
+        sessions = win32ts.WTSEnumerateSessions(
+            win32ts.WTS_CURRENT_SERVER_HANDLE, 1, 0
+        )
+        active_state = getattr(win32ts, "WTSActive", 0)
+        active_sessions = [
+            session
+            for session in sessions
+            if session.get("State") == active_state
+            and session.get("SessionId", 0) != 0
+        ]
+
+        if not active_sessions:
+            log.warning(
+                "No active interactive Windows session found; creating printer DC in current security context for %r",
+                printer_name,
+            )
+            dc.CreatePrinterDC(printer_name)
+            return dc
+
+        console_session_id = win32ts.WTSGetActiveConsoleSessionId()
+        session = next(
+            (
+                item
+                for item in active_sessions
+                if item.get("SessionId") == console_session_id
+            ),
+            active_sessions[0],
+        )
+        session_id = session["SessionId"]
+
+        token = win32ts.WTSQueryUserToken(session_id)
+        win32security.ImpersonateLoggedOnUser(token)
+        try:
+            dc.CreatePrinterDC(printer_name)
+        finally:
+            win32security.RevertToSelf()
+
+        log.info(
+            "Printer DC created using active-user preferences: printer=%r session_id=%s station=%r",
+            printer_name,
+            session_id,
+            session.get("WinStationName"),
+        )
+        return dc
+
+    except Exception:
+        log.exception(
+            "Unable to create printer DC using active-user preferences for %r; falling back to current security context",
+            printer_name,
+        )
+        try:
+            dc.DeleteDC()
+        except Exception:
+            pass
+        dc = win32ui.CreateDC()
+        dc.CreatePrinterDC(printer_name)
+        return dc
+    finally:
+        if token is not None:
+            try:
+                token.Close()
+            except Exception:
+                pass
+
+
 def print_pdf(pdf_bytes, printer_name):
     if not printer_name:
         raise RuntimeError("No Windows printer queue is selected")
@@ -170,9 +248,8 @@ def print_pdf(pdf_bytes, printer_name):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_count = len(doc)
     log.info("Print job starting: printer=%r bytes=%d pages=%d", printer_name, len(pdf_bytes), page_count)
-    dc = win32ui.CreateDC()
+    dc = create_printer_dc(printer_name)
     try:
-        dc.CreatePrinterDC(printer_name)
         printable_w = dc.GetDeviceCaps(win32con.HORZRES)
         printable_h = dc.GetDeviceCaps(win32con.VERTRES)
         dc.StartDoc("DellPrintBridge job")
