@@ -2,54 +2,56 @@
 
 **Give a perfectly good old printer a second life by turning its working Windows driver into a modern, driverless IPP print bridge.**
 
-DellPrintBridge exposes an existing Windows printer queue to phones and other modern clients as a network IPP printer. Android can discover the bridge through its built-in **Default Print Service** and send a print job without installing the printer manufacturer's discontinued or proprietary mobile app.
+DellPrintBridge exposes existing Windows printer queues to phones and other modern clients as network IPP printers. Android can discover the bridge through its built-in **Default Print Service** and print without installing a discontinued or proprietary manufacturer mobile app.
 
-> **Confirmed working:** native Android printing through DellPrintBridge to a Dell C1765nfw Color MFP using the existing Dell Windows driver.
+> **Confirmed working:** native Android printing through one DellPrintBridge instance to both a Dell C1765nfw Color MFP and a USB-connected PL70e thermal label printer using their existing Windows drivers.
 
 ## Why this project exists
 
-This project started because I had an older printer that still worked perfectly from Windows, but its useful mobile software support had disappeared. The hardware was fine; the compatibility layer around it was not.
+This project started because an older printer still worked perfectly from Windows, but useful Android support had disappeared. The hardware was fine; the missing piece was a modern compatibility layer.
 
-Android's built-in printing system expects a modern driverless network printer using protocols such as IPP and service discovery through mDNS/DNS-SD. Older printers often predate those standards, and manufacturers may no longer maintain their Android apps or current mobile drivers.
+Android's built-in printing system expects driverless network printing using protocols such as IPP with service discovery through mDNS/DNS-SD. Older printers often predate those standards, and manufacturers may stop maintaining their mobile apps long before the hardware itself stops working.
 
 DellPrintBridge fills that gap:
 
 ```text
-Modern device                  Legacy-but-working printer
+Modern device                     Existing printer
      |                                  ^
      | native IPP                       |
      v                                  | existing vendor driver
 DellPrintBridge -> Windows spooler -----+
 ```
 
-Instead of teaching Android how to use an old vendor driver, DellPrintBridge lets Android speak a modern protocol and lets Windows do what it already does well: drive the printer.
-
-Although the first real-world target is a Dell C1765nfw Color MFP, the bridge is intentionally designed around **Windows printer queues**, not a particular Dell model. If Windows can print to a device, DellPrintBridge may be able to provide a modern IPP front end for it.
+The bridge is intentionally designed around **Windows printer queues**, not one specific Dell model. If Windows can print to a device, DellPrintBridge may be able to provide a modern IPP front end for it.
 
 ## What it does
 
-DellPrintBridge runs on a Windows machine that already has the printer installed and working. It currently:
+DellPrintBridge runs on a Windows machine that already has one or more printers installed and working. It currently:
 
-- Enumerates printers installed in Windows.
-- Provides a small web console for choosing which Windows queue to publish.
-- Advertises the selected printer with **mDNS / DNS-SD** as `_ipp._tcp.local`.
-- Hosts an **IPP endpoint on TCP 631**.
+- Enumerates printer queues installed in Windows.
+- Publishes multiple Windows queues simultaneously as independent IPP printers.
+- Provides a web console for adding, editing, enabling, disabling, and removing published printers.
+- Gives each published printer its own advertised name, IPP resource path, UUID, mDNS service, and capability profile.
+- Advertises each enabled printer with **mDNS / DNS-SD** as `_ipp._tcp.local`.
+- Hosts the IPP service on **TCP 631**.
 - Handles the IPP discovery/query operations required by the tested Android Default Print Service.
 - Handles HTTP/1.1 `Expect: 100-continue`, normal `Content-Length` bodies, and chunked transfer encoding.
 - Accepts PDF print jobs.
-- Renders PDF pages with PyMuPDF/Pillow.
-- Sends rendered pages through the selected Windows queue using `pywin32` and Windows GDI/spooler APIs.
+- Renders PDF pages with PyMuPDF/Pillow and sends them through Windows GDI/spooler APIs.
 - Leaves final printer-specific communication to the existing Windows vendor driver.
+- Includes per-printer profiles for standard Letter/A4 color printers and 4x6 monochrome thermal label printers.
+- Refreshes mDNS advertisements automatically when published-printer configuration changes.
+- Includes an automatic light/dark web UI that follows the browser/Windows theme.
 - Includes a Windows system-tray companion for status and control.
 - Includes a tested in-place updater for development/Git installations.
 - Includes a one-click Windows installer build/release pipeline.
 
-There is **no DellPrintBridge Android app**. That is intentional. The goal is for the printer to appear in Android's normal system print dialog.
+There is **no DellPrintBridge Android app**. That is intentional. The goal is for published printers to appear directly in Android's normal system print dialog.
 
 ## Architecture
 
 ```text
-                    LOCAL NETWORK
+                         LOCAL NETWORK
 
 +---------------------------+
 | Android phone / tablet    |
@@ -63,23 +65,26 @@ There is **no DellPrintBridge Android app**. That is intentional. The goal is fo
 +-------------+-------------+
 | Windows PC / Server       |
 | DellPrintBridge backend   |
-|  - mDNS advertisement     |
+|  - mDNS advertisements    |
 |  - IPP server             |
 |  - PDF renderer           |
 |  - Web console :8631      |
 +-------------+-------------+
               |
               | Windows GDI / Print Spooler
-              v
-+-------------+-------------+
-| Installed Windows queue   |
-+-------------+-------------+
-              |
-              | Existing manufacturer driver
-              v
-+-------------+-------------+
-| Physical printer          |
-+---------------------------+
+        +-----+----------------------+
+        |                            |
+        v                            v
++-------------------+       +-------------------+
+| Dell Windows      |       | Thermal Windows   |
+| printer queue     |       | printer queue     |
++---------+---------+       +---------+---------+
+          |                           |
+          v                           v
++-------------------+       +-------------------+
+| Dell C1765nfw     |       | PL70e thermal     |
+| network printer   |       | USB printer       |
++-------------------+       +-------------------+
 
 Interactive Windows session
         |
@@ -91,26 +96,90 @@ Interactive Windows session
              - exit backend + tray
 ```
 
-The Android device does **not** need to understand the physical printer. Android talks to DellPrintBridge, DellPrintBridge talks to the Windows print subsystem, and Windows plus the existing driver talk to the printer.
+The Android device does **not** need to understand the physical printer. Android talks to DellPrintBridge, DellPrintBridge talks to the Windows print subsystem, and Windows plus the existing vendor driver talk to the printer.
 
 ## Web console
 
-DellPrintBridge includes a lightweight local configuration page on TCP **8631**:
+DellPrintBridge includes a local management page on TCP **8631**:
 
 ```text
 http://localhost:8631
 ```
 
-The console currently lets you choose an installed Windows printer queue and set the name DellPrintBridge advertises to network clients.
+The console shows all published printers and allows you to:
 
-The original test configuration used:
+- Choose the underlying Windows printer queue.
+- Set the advertised printer name shown to Android.
+- Choose a capability profile.
+- Enable or disable mDNS/IPP publication for a printer.
+- Remove a published printer.
+- Add additional Windows printer queues.
+
+Each printer receives a unique IPP resource. The original migrated Dell configuration keeps the legacy path:
 
 ```text
-Windows queue:   Dell C1765nfw Color MFP-00000
-Advertised name: Dell Print Bridge
+/ipp/print
 ```
 
-The web UI is deliberately simple right now. Multi-printer management is planned; see the roadmap below.
+Additional printers use paths such as:
+
+```text
+/ipp/printers/nelko-thermal
+```
+
+Configuration changes automatically refresh the mDNS advertisements; a bridge restart is no longer required just to add, edit, enable, disable, or remove a published printer.
+
+### Dark mode
+
+The web console supports both light and dark themes using the browser's `prefers-color-scheme` setting. No separate DellPrintBridge setting is required:
+
+- Windows/browser light theme -> light UI.
+- Windows/browser dark theme -> dark UI.
+
+The dark theme covers the page background, cards, form controls, disabled fields, badges, success/warning messages, and other management UI elements.
+
+## Multi-printer support
+
+A single DellPrintBridge instance can now publish multiple Windows queues at the same time. Each appears to Android as a separate printer.
+
+Example tested configuration:
+
+```text
+Android
+   |
+   +--> Dell Print Bridge
+   |       IPP: /ipp/print
+   |       Profile: Letter / A4 color printer
+   |       -> Dell C1765nfw Color MFP-00000
+   |
+   +--> Nelko Thermal
+           IPP: /ipp/printers/nelko-thermal
+           Profile: 4 x 6 thermal label printer
+           -> PL70e-BT-usb
+           -> USB001
+```
+
+The PL70e test is important because the physical printer itself does not provide Android IPP printing. It is passed into the Windows print-server VM over USB, installed as a normal Windows queue, and DellPrintBridge supplies the network-facing IPP/mDNS layer.
+
+### Capability profiles
+
+Current built-in profiles are:
+
+**Letter / A4 color printer**
+
+- Letter and A4 media advertisement.
+- 300 DPI advertisement.
+- Color and monochrome modes.
+- One-sided printing.
+
+**4 x 6 thermal label printer**
+
+- 4x6 media advertisement.
+- 203 DPI advertisement.
+- Monochrome printing.
+- One-sided printing.
+
+These profiles control what DellPrintBridge tells Android about the published printer. The actual physical rendering is still performed through the selected Windows queue and driver.
 
 ## System tray companion
 
@@ -128,7 +197,7 @@ Tray actions:
 - **Update DellPrintBridge** launches the appropriate updater elevated.
 - **Exit DellPrintBridge** stops the backend and closes the tray companion. Installed scheduled tasks remain in place for the next normal startup/logon.
 
-The tray continuously checks backend health and refreshes its icon/menu state automatically. This allows the backend to be recovered from the tray after a crash or manual stop without opening Task Scheduler.
+The tray continuously checks backend health and refreshes its icon/menu state automatically. This allows the backend to be recovered after a crash or manual stop without opening Task Scheduler.
 
 The tray process is intentionally separate because Windows isolates SYSTEM tasks/services from the interactive user desktop.
 
@@ -136,62 +205,74 @@ The tray process is intentionally separate because Windows isolates SYSTEM tasks
 
 ### Working today
 
-The prototype has successfully completed the intended end-to-end path:
+The current development build has successfully completed both of these end-to-end paths:
 
 ```text
 Android Default Print Service
-        -> IPP
         -> DellPrintBridge
-        -> Windows printer queue
-        -> existing Windows driver
-        -> physical printer
+        -> Dell Windows queue
+        -> Dell C1765nfw
+```
+
+and:
+
+```text
+Android Default Print Service
+        -> DellPrintBridge
+        -> PL70e Windows queue
+        -> USB
+        -> PL70e thermal label printer
 ```
 
 Current functionality includes:
 
-- Windows printer queue enumeration.
-- Web-based queue selection.
-- Configurable advertised printer name.
-- mDNS/DNS-SD discovery.
-- IPP over TCP 631.
+- Multiple simultaneously published Windows printer queues.
+- Web-based add/edit/enable/disable/remove controls.
+- Backward-compatible automatic migration of the original single-printer configuration.
+- Unique IPP paths and stable UUIDs per published printer.
+- Separate mDNS advertisements per printer.
+- Automatic mDNS refresh after configuration changes.
+- Per-printer capability profiles.
+- Letter/A4 color and 4x6 monochrome thermal profiles.
+- Native Android Default Print Service discovery and printing.
 - Android-compatible IPP capability advertisement.
 - `Get-Printer-Attributes`, `Get-Jobs`, `Validate-Job`, and `Print-Job`.
 - HTTP `Expect: 100-continue` support.
 - `Content-Length` and chunked request-body support.
 - PDF input and rendering through the Windows graphics/printing stack.
+- Automatic light/dark web UI.
 - Rotating diagnostic logs.
 - Private-profile Windows Firewall rules.
 - Startup scheduled task for the SYSTEM backend.
 - Interactive logon scheduled task for the tray companion.
 - Tray health/status, start, update, and exit controls.
 - In-place Git updater with restart, health check, and rollback handling.
-- Safe updater handoff so an update that replaces the updater itself continues using the newly pulled worker code.
+- Safe updater handoff so updates that replace updater components continue with freshly pulled worker code.
 - One-click installer build using PyInstaller and Inno Setup.
 - GitHub Actions installer builds and release-aware packaged update support.
 
 ### Prototype limitations
 
-This is still early software. It does **not** yet provide:
+DellPrintBridge is still early software. It does **not** yet provide:
 
 - A native Windows Service; the backend currently runs as a SYSTEM scheduled task.
-- Automatic mDNS refresh after changing configuration; restart the bridge after changing the published queue/name.
 - Automatic discovery of every Windows driver capability.
-- Full dynamic color/duplex/tray/media capability translation.
+- Full dynamic duplex/tray/media/copy capability translation from the Windows driver.
+- DellPrintBridge-side thermal image preprocessing/dithering; thermal image rendering currently depends on the Windows driver.
 - PWG Raster input.
 - Apple URF/AirPrint as a tested feature.
-- Multiple simultaneously published Windows queues yet.
 - Authentication or Internet-facing security.
 
 The current project should be considered a **trusted-LAN prototype**.
 
 ## How Android discovers it
 
-DellPrintBridge publishes an `_ipp._tcp.local` service through mDNS/DNS-SD. Android's Default Print Service discovers the service and queries the bridge over IPP.
+DellPrintBridge publishes one `_ipp._tcp.local` service for each enabled printer. Android's Default Print Service discovers those services and queries the corresponding IPP resource on TCP 631.
 
-During development, two compatibility details were especially important:
+Two compatibility details were especially important during development:
 
 1. Android sends HTTP `Expect: 100-continue` before a number of IPP POST bodies. Correctly acknowledging that exchange was required for reliable printing.
-2. Android was sensitive to the advertised IPP capability set. DellPrintBridge now returns a broader set of printer identity, document-format, media, resolution, color, quality, and job-creation attributes.
+2. Android was sensitive to the advertised IPP capability set. DellPrintBridge returns printer identity, document-format, media, resolution, color, quality, and job-creation attributes appropriate to the configured profile.
 
 IPP is carried over HTTP, so both layers must behave in a way the client accepts.
 
@@ -200,16 +281,17 @@ IPP is carried over HTTP, so both layers must behave in a way the client accepts
 For a PDF job, the current path is roughly:
 
 ```text
-1. Android discovers DellPrintBridge with mDNS.
-2. Android queries printer capabilities over IPP.
+1. Android discovers a published DellPrintBridge printer with mDNS.
+2. Android queries that printer's capabilities over its unique IPP resource.
 3. Android validates the proposed print job.
 4. Android sends an IPP Print-Job containing the PDF.
-5. DellPrintBridge extracts the PDF from the IPP request.
-6. PyMuPDF renders each PDF page.
-7. Pillow/ImageWin prepares the rendered page for Windows GDI.
-8. pywin32 opens the selected Windows printer DC.
-9. The page is submitted through the Windows print subsystem.
-10. The existing manufacturer driver sends the job to the physical printer.
+5. DellPrintBridge maps the request path to the configured Windows queue.
+6. DellPrintBridge extracts the PDF from the IPP request.
+7. PyMuPDF renders each PDF page.
+8. Pillow/ImageWin prepares the rendered page for Windows GDI.
+9. pywin32 opens the selected Windows printer DC.
+10. The page is submitted through the Windows print subsystem.
+11. The existing manufacturer driver sends the job to the physical printer.
 ```
 
 DellPrintBridge is therefore a **protocol and compatibility bridge**, not a replacement printer driver.
@@ -220,10 +302,10 @@ DellPrintBridge is therefore a **protocol and compatibility bridge**, not a repl
 
 - Windows 10/11 or Windows Server.
 - Python 3.10 or newer.
-- A printer already installed in Windows.
-- A working Windows driver for that printer.
-- The printer should successfully print from Windows before troubleshooting DellPrintBridge.
-- For initial testing, put the Android device and bridge host on the same LAN/subnet so mDNS discovery is straightforward.
+- One or more printers already installed in Windows.
+- Working Windows drivers for those printers.
+- Each queue should successfully print from Windows before troubleshooting DellPrintBridge.
+- For initial testing, place the Android device and bridge host on the same LAN/subnet so mDNS discovery is straightforward.
 
 ### Clone and install
 
@@ -265,16 +347,17 @@ Git/development installations update with:
 .\update.ps1
 ```
 
-The updater verifies the working tree, fetches the upstream branch, performs a fast-forward-only update, and then hands execution to a fresh worker process from the newly pulled code. This handoff is important when an update changes the updater itself: PowerShell no longer continues the remainder of the update using a stale in-memory copy of the old updater.
+The updater verifies the working tree, fetches the upstream branch, performs a fast-forward-only update, and hands execution to a fresh worker process from the newly pulled code. This avoids the previous self-update race where the first update attempt could continue using stale in-memory updater code.
 
 The worker then:
 
 1. Stops DellPrintBridge and the tray.
-2. Reuses the existing Python virtual environment.
-3. Updates dependencies and task registration.
-4. Restarts the backend and tray.
-5. Performs a health check against `http://localhost:8631/`.
-6. Attempts rollback if a newly installed update fails.
+2. Waits for project Python processes to exit and cleans up leftovers if necessary.
+3. Reuses the existing Python virtual environment.
+4. Updates dependencies and scheduled-task registration.
+5. Restarts the backend and tray.
+6. Performs a health check against `http://localhost:8631/`.
+7. Attempts rollback if a newly installed update fails.
 
 Diagnostics are written to:
 
@@ -282,14 +365,14 @@ Diagnostics are written to:
 %ProgramData%\DellPrintBridge\update.log
 ```
 
-The updater has been tested for normal updates, no-change/idempotent runs, tray-initiated updates, and updates that replace updater components.
+The updater has been tested for normal updates, no-change/idempotent runs, tray-initiated updates, updates that replace updater components, and first-attempt success after the staged worker change.
 
 ## One-click Windows installer
 
 The target destination experience is:
 
 ```text
-Download EXE -> double-click -> UAC -> install -> tray appears -> configure printer -> print
+Download EXE -> double-click -> UAC -> install -> tray appears -> configure printers -> print
 ```
 
 The destination machine does **not** need Python, Git, pip, a repository clone, or command-line setup.
@@ -362,7 +445,12 @@ Browse to:
 http://localhost:8631
 ```
 
-Select a working Windows printer queue and choose the name that should appear on Android.
+Use the web console to publish any Windows queues you want Android to see. For each published printer choose:
+
+- The Windows printer queue.
+- The advertised printer name.
+- The capability profile.
+- Whether the printer is currently advertised.
 
 Configuration is stored in:
 
@@ -370,7 +458,7 @@ Configuration is stored in:
 %ProgramData%\DellPrintBridge\config.json
 ```
 
-During the current prototype stage, restart DellPrintBridge after changing the selected printer or advertised name so the mDNS advertisement is recreated.
+Legacy configuration files containing the original `printer_name` and `display_name` fields are automatically migrated to the current `printers` list format. The migrated original printer keeps the `/ipp/print` resource so existing Android discovery continues to work.
 
 ## Printing from Android
 
@@ -378,10 +466,28 @@ During the current prototype stage, restart DellPrintBridge after changing the s
 2. Connect Android to the same LAN as DellPrintBridge.
 3. Open a printable document or PDF.
 4. Choose **Print**.
-5. Select the printer advertised by DellPrintBridge.
+5. Select the desired DellPrintBridge-published printer.
 6. Send the job.
 
-No manufacturer print application is necessary for the tested path.
+Multiple published printers appear as separate choices in the Android print interface.
+
+No manufacturer Android print application is required for the tested paths.
+
+## Thermal-printer notes
+
+The tested PL70e appears in Windows as a normal local printer queue:
+
+```text
+Queue:  PL70e-BT-usb
+Driver: PL70e-BT
+Port:   USB001
+```
+
+DellPrintBridge can publish that queue to Android using the **4 x 6 thermal label printer** profile even though the printer itself does not provide native Android IPP support.
+
+At present DellPrintBridge sends rendered page graphics to the Windows driver and relies on that driver for final monochrome conversion, thresholding, halftoning, or dithering. The PL70e driver exposes threshold/dither controls, but driver rendering behavior is still being evaluated. DellPrintBridge-side optional thermal preprocessing/dithering is a possible future enhancement.
+
+Because the backend runs as SYSTEM, printer preferences that are stored per Windows user may not necessarily be the same preferences seen by the backend. If a driver setting affects direct interactive-user printing but not DellPrintBridge jobs, SYSTEM-context printer DEVMODE/preferences are worth investigating.
 
 ## Logging and troubleshooting
 
@@ -411,48 +517,17 @@ Test the Windows print path first:
 
 If Windows cannot print to the queue, fix that before troubleshooting DellPrintBridge.
 
+When troubleshooting multiple printers, the IPP log includes the advertised printer name and request path so jobs can be traced to the correct configured Windows queue.
+
 ## Uninstall behavior
 
-The installer cleanup removes the DellPrintBridge scheduled tasks and Windows Firewall rules. Runtime configuration and logs under `%ProgramData%\DellPrintBridge` are intentionally preserved so a reinstall does not automatically discard the selected printer or diagnostic history.
+The installer cleanup removes the DellPrintBridge scheduled tasks and Windows Firewall rules. Runtime configuration and logs under `%ProgramData%\DellPrintBridge` are intentionally preserved so a reinstall does not automatically discard published-printer configuration or diagnostic history.
 
 ## Security
 
 DellPrintBridge currently has **no authentication**. It is intended for a trusted private network while the project is under development. Do not expose TCP 631 or TCP 8631 directly to the public Internet.
 
 Firewall rules created by the setup use the Windows **Private** network profile.
-
-## Multi-printer direction
-
-The current implementation publishes one selected Windows queue, but the architecture is intentionally moving toward **multiple simultaneously advertised printers**.
-
-The planned model is one DellPrintBridge instance with multiple configured Windows queues, each exposed as an independent IPP printer and mDNS advertisement. For example:
-
-```text
-Android
-   |
-   +--> Dell Print Bridge
-   |       -> Dell Windows queue
-   |       -> Dell C1765nfw
-   |
-   +--> Thermal Label Printer
-           -> Windows thermal-printer queue
-           -> USB/Bluetooth-connected label printer
-```
-
-A USB printer does not need to understand IPP itself. As long as Windows has a working queue/driver, DellPrintBridge can potentially provide the network-facing IPP layer.
-
-Planned multi-printer work includes:
-
-- A list of advertised printers in the web console instead of a single queue selector.
-- Add/edit/disable/remove controls for published queues.
-- A unique IPP resource path for each printer, such as `/printers/dell` and `/printers/thermal`.
-- A separate mDNS advertisement for each published printer.
-- Per-printer capabilities rather than one global capability set.
-- Media profiles such as Letter/A4 for office printers and 4x6 for thermal label printers.
-- Per-printer color/monochrome and resolution advertisement.
-- Automatic migration of the existing single-printer configuration into the new multi-printer configuration format.
-
-A thermal label printer connected to the Windows bridge by USB is planned as the first multi-printer/capability-profile test case.
 
 ## Project philosophy
 
@@ -464,7 +539,7 @@ DellPrintBridge puts a compatibility layer in front of hardware that already wor
 
 **modern protocol in, proven legacy driver out.**
 
-The Dell C1765nfw was simply the reason to build it. The architecture is intentionally broader than that one printer.
+The Dell C1765nfw was simply the reason to build it. The working PL70e USB thermal-printer test demonstrates why the architecture is intentionally broader than that one printer.
 
 ## Roadmap
 
@@ -472,16 +547,15 @@ Near-term work:
 
 - Validate the one-click installer end-to-end on a clean Windows machine/VM.
 - Validate packaged in-place upgrades and uninstall/reinstall behavior.
-- Add multi-printer publishing and per-printer IPP/mDNS identities.
-- Test a USB-connected 4x6 thermal label printer as the second published printer.
-- Add dynamic/per-printer media, color, resolution, duplex, tray, and copy capabilities.
-- Improve the web management console for multiple printers.
-- Dynamically refresh mDNS advertisements after configuration changes.
+- Continue improving per-printer capabilities and management UI.
+- Investigate optional DellPrintBridge-side thermal dithering/image preprocessing if Windows thermal drivers do not provide reliable results.
+- Investigate SYSTEM-context printer preferences/DEVMODE handling where driver settings are user-specific.
 - Publish signed installer builds when practical.
 
 Longer-term possibilities:
 
 - Run the backend as a native Windows Service.
+- Read more capabilities dynamically from Windows printer drivers.
 - Improve IPP job state/status reporting.
 - Add additional document formats where useful.
 - Explore PWG Raster support.
@@ -491,7 +565,7 @@ Longer-term possibilities:
 
 DellPrintBridge was created by **Josh Nichols** as a practical solution to a reliable old printer that Windows could still drive but modern Android could no longer use natively.
 
-The project began with the Dell C1765nfw Color MFP but is being developed with a broader goal: extend the useful life of printers that still have a functional Windows print path.
+The project began with the Dell C1765nfw Color MFP and has since successfully bridged a second, very different device: a USB-connected PL70e 4x6 thermal label printer. The broader goal is to extend the useful life of printers that still have a functional Windows print path, regardless of whether the physical printer itself knows anything about modern mobile printing.
 
 Contributions, testing against other printers, protocol improvements, and compatibility reports are welcome.
 
